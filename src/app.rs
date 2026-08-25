@@ -1,7 +1,14 @@
 use crate::config::{self, BadgePosition, CameraConfig, Config};
+use crate::discover::net::{self, InterfaceInfo};
+use crate::discover::probe::DISCOVER_PROBE_TIMEOUT;
+use crate::discover::scan::DEFAULT_PORTS;
+use crate::discover::{
+    AuthStatus, DiscoveryConfig, DiscoveryHandle, DiscoveryResult, DiscoverySnapshot, Phase,
+};
 use crate::stream::{Status, StreamHandle};
 use crate::theme::{self, BtnVariant};
 use eframe::egui;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +22,7 @@ const GRID_SPACING: f32 = 12.0;
 enum View {
     Grid,
     Solo(usize),
+    Discover,
     Settings,
 }
 
@@ -88,12 +96,609 @@ enum SettingsAction {
     Save,
 }
 
+// ---------------------------------------------------------------------------
+// Discover wizard (REQ-12…REQ-15, REQ-10 rows, REQ-6 hint)
+// ---------------------------------------------------------------------------
+
+/// One results row: the discovery outcome plus UI bookkeeping. `duplicate`
+/// marks any collision with the configured cameras; `exact_duplicate` marks
+/// the strict exact-string-URL subset that is excluded from ADD SELECTED.
+struct DiscoverRow {
+    result: DiscoveryResult,
+    checked: bool,
+    duplicate: bool,
+    exact_duplicate: bool,
+}
+
+impl DiscoverRow {
+    fn new(result: DiscoveryResult) -> Self {
+        Self {
+            result,
+            checked: false,
+            duplicate: false,
+            exact_duplicate: false,
+        }
+    }
+
+    /// Enabled-checkbox semantics per REQ-10: only credentialed/open hosts
+    /// with a working URL are addable; exact duplicates are excluded.
+    fn addable(&self) -> bool {
+        self.result.url.is_some()
+            && matches!(
+                self.result.auth,
+                AuthStatus::Open | AuthStatus::Authenticated
+            )
+            && !self.exact_duplicate
+    }
+
+    fn key(&self) -> String {
+        result_key(&self.result)
+    }
+}
+
+fn result_key(result: &DiscoveryResult) -> String {
+    result.url.clone().unwrap_or_else(|| result.ip.to_string())
+}
+
+/// Authority host of an rtsp/http URL: scheme stripped, userinfo cut at the
+/// LAST '@' (passwords may contain '@'), port cut at ':'.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = if host_port.starts_with('[') {
+        host_port
+    } else {
+        host_port.split(':').next()?
+    };
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
+/// The wizard's single global credential pair: trimmed; present when a
+/// username is given (blank passwords stay legal as `user:` in URLs).
+fn global_creds(username: &str, password: &str) -> Option<(String, String)> {
+    let username = username.trim();
+    (!username.is_empty()).then(|| (username.to_owned(), password.trim().to_owned()))
+}
+
+/// Existing list plus extras, dropping any extra whose URL string exactly
+/// matches an existing camera or an earlier extra (belt-and-braces dedup,
+/// same equality `apply_cameras` uses for stream reuse).
+fn merge_cameras(existing: &[CameraConfig], extra: Vec<CameraConfig>) -> Vec<CameraConfig> {
+    let mut merged = existing.to_vec();
+    for cam in extra {
+        if !merged.iter().any(|m| m.url == cam.url) {
+            merged.push(cam);
+        }
+    }
+    merged
+}
+
+/// `{vendor} {ip}`, falling back to the sequential `Cam N` convention.
+fn discovered_name(vendor: Option<&str>, ip: Ipv4Addr, fallback: usize) -> String {
+    match vendor {
+        Some(vendor) => format!("{vendor} {ip}"),
+        None => format!("Cam {fallback}"),
+    }
+}
+
+/// CameraConfig values built from checked addable rows; numbering continues
+/// after the existing cameras, matching the Settings `Cam N` convention.
+fn selected_cameras(rows: &[DiscoverRow], existing_count: usize) -> Vec<CameraConfig> {
+    rows.iter()
+        .filter(|row| row.checked && row.addable())
+        .enumerate()
+        .map(|(i, row)| CameraConfig {
+            name: discovered_name(
+                row.result.vendor.as_deref(),
+                row.result.ip,
+                existing_count + i + 1,
+            ),
+            url: row.result.url.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Reconcile wizard rows against the latest snapshot results keyed by URL
+/// (IP fallback for not-yet-authenticated hosts): checkbox state preserved
+/// across frames, new rows default unchecked, duplicate layers marked, and
+/// vanished results dropped. Transport-failure hosts never appear here by
+/// upstream contract (`probe_pool` only emits qualifying results).
+fn reconcile_rows(
+    rows: &mut Vec<DiscoverRow>,
+    results: &[DiscoveryResult],
+    existing: &[CameraConfig],
+) {
+    for result in results {
+        let key = result_key(result);
+        match rows.iter_mut().find(|row| row.key() == key) {
+            Some(row) => row.result = result.clone(),
+            None => {
+                let exact_duplicate = result
+                    .url
+                    .as_deref()
+                    .is_some_and(|url| existing.iter().any(|cam| cam.url == url));
+                let ip = result.ip.to_string();
+                let duplicate = exact_duplicate
+                    || existing
+                        .iter()
+                        .any(|cam| url_host(&cam.url).as_deref() == Some(ip.as_str()));
+                let mut row = DiscoverRow::new(result.clone());
+                row.duplicate = duplicate;
+                row.exact_duplicate = exact_duplicate;
+                rows.push(row);
+            }
+        }
+    }
+    rows.retain(|row| results.iter().any(|result| result_key(result) == row.key()));
+}
+
+/// Wizard state machine (REQ-13): `handle.is_some()` is Scanning, non-empty
+/// `rows` without a handle is Results, everything else Idle.
+struct DiscoverWizard {
+    interfaces: Vec<InterfaceInfo>,
+    selected_iface: usize,
+    username: String,
+    password: String,
+    handle: Option<DiscoveryHandle>,
+    latest: Option<DiscoverySnapshot>,
+    rows: Vec<DiscoverRow>,
+    error: Option<String>,
+    cancelling: bool,
+    /// WS-Discovery hint inputs (found, degraded), set once past Configuring.
+    ws: Option<(u32, bool)>,
+}
+
+impl DiscoverWizard {
+    fn new() -> Self {
+        // REQ-1: enumerate once on view entry; default to the first RFC1918.
+        let interfaces = net::list_interfaces();
+        let selected_iface = net::pick_default_subnet(&interfaces).unwrap_or(0);
+        Self {
+            interfaces,
+            selected_iface,
+            username: String::new(),
+            password: String::new(),
+            handle: None,
+            latest: None,
+            rows: Vec::new(),
+            error: None,
+            cancelling: false,
+            ws: None,
+        }
+    }
+
+    /// Live snapshot pull at the top of `update()` (REQ-4): reconciles rows
+    /// and transitions out of Scanning once a terminal phase lands. The
+    /// handle is taken (not leaked) only after the pipeline thread finished,
+    /// so its Drop-join returns instantly instead of blocking the UI.
+    fn poll(&mut self, existing: &[CameraConfig]) {
+        let snap = match self.handle.as_ref() {
+            Some(handle) => handle.snapshot(),
+            None => return,
+        };
+        if !matches!(snap.phase, Phase::Configuring) {
+            self.ws = Some((snap.ws_found, snap.ws_degraded));
+        }
+        self.latest = Some(snap.clone());
+        reconcile_rows(&mut self.rows, &snap.results, existing);
+
+        if !matches!(
+            snap.phase,
+            Phase::Complete | Phase::Cancelled | Phase::Failed(_)
+        ) {
+            return;
+        }
+        self.handle.take(); // Thread already joined; Drop returns instantly.
+        self.cancelling = false;
+        match snap.phase {
+            Phase::Cancelled => self.rows.clear(), // REQ-4: Idle, inputs kept.
+            Phase::Failed(reason) => self.error = Some(reason),
+            _ => {}
+        }
+    }
+
+    fn start_scan(&mut self) {
+        let Some(interface) = self.interfaces.get(self.selected_iface) else {
+            return;
+        };
+        // REQ-1 clamp scenario: always the containing /24 regardless of the
+        // interface's reported prefix.
+        let Some(subnet) = net::subnet_of(interface.ip, 24) else {
+            self.error = Some(format!("cannot derive /24 subnet from {}", interface.ip));
+            return;
+        };
+        self.rows.clear();
+        self.latest = None;
+        self.error = None;
+        self.cancelling = false;
+        self.ws = None;
+        self.handle = Some(DiscoveryHandle::start(DiscoveryConfig {
+            subnet,
+            ports: DEFAULT_PORTS.to_vec(),
+            creds: global_creds(&self.username, &self.password),
+            probe_timeout: DISCOVER_PROBE_TIMEOUT,
+        }));
+    }
+
+    /// Signals cancellation; the wizard keeps polling until the pipeline
+    /// reports terminal so Drop never blocks the UI on probe wind-down.
+    fn request_cancel(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.cancel();
+        }
+        self.cancelling = true;
+    }
+
+    /// Ends the wizard from outside the Discover view (task 6.3 / REQ-4
+    /// nav-away guarantee). Cancellation is signalled synchronously; the
+    /// handle then moves to a detached closer thread so its Drop-join (up to
+    /// one in-flight probe attempt plus poll granularity) never blocks UI
+    /// repaints. Chosen over deferring the drop to a later `update()` tick:
+    /// this runs exactly once at transition time and does not depend on
+    /// repaint cadence, focus state, or extra per-frame app state.
+    fn end_detached(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            Self::detach_handle(handle);
+        }
+    }
+
+    /// RAII hand-off. If spawning fails, std drops the closure inline — the
+    /// handle still cancels and joins, just synchronously; nothing leaks.
+    fn detach_handle(handle: DiscoveryHandle) {
+        handle.cancel();
+        let _ = std::thread::Builder::new()
+            .name("discover-close".to_owned())
+            .spawn(move || drop(handle));
+    }
+
+    fn back_to_idle(&mut self) {
+        self.rows.clear();
+        self.latest = None;
+        self.error = None;
+    }
+
+    fn show(&mut self, ctx: &egui::Context) -> DiscoverAction {
+        let mut action = DiscoverAction::None;
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::SOOT)
+                    .inner_margin(egui::Margin::same(24)),
+            )
+            .show(ctx, |ui| {
+                paper_visuals(ui);
+                ui.label(
+                    egui::RichText::new("DISCOVER")
+                        .font(theme::display_font(30.0))
+                        .color(theme::INK),
+                );
+                ui.label(theme::micro_label(
+                    format!(
+                        "LOCAL NETWORK \u{b7} RTSP AUTO-DISCOVERY \u{b7} {} INTERFACES",
+                        self.interfaces.len()
+                    ),
+                    theme::LABEL_ON_PAPER,
+                ));
+                ui.add_space(8.0);
+
+                if let Some(err) = &self.error {
+                    error_line(ui, err);
+                    ui.add_space(4.0);
+                }
+
+                if self.handle.is_some() {
+                    self.show_scanning(ui, &mut action);
+                } else if self.rows.is_empty() {
+                    self.show_idle(ui, &mut action);
+                } else {
+                    self.show_results(ui, &mut action);
+                }
+            });
+        action
+    }
+
+    fn show_idle(&mut self, ui: &mut egui::Ui, action: &mut DiscoverAction) {
+        ui.add_space(4.0);
+        if self.interfaces.is_empty() {
+            ui.label(theme::micro_label(
+                "NO NETWORK INTERFACES FOUND",
+                theme::LABEL_ON_PAPER,
+            ));
+            ui.label(theme::micro_label(
+                "ADD A CAMERA MANUALLY IN SETTINGS",
+                theme::LABEL_ON_PAPER,
+            ));
+            return;
+        }
+
+        ui.label(theme::micro_label("SUBNET", theme::LABEL_ON_PAPER));
+        egui::ComboBox::from_id_salt("discover_subnet")
+            .selected_text(self.subnet_label(self.selected_iface))
+            .width(280.0)
+            .show_ui(ui, |ui| {
+                for i in 0..self.interfaces.len() {
+                    let label = self.subnet_label(i);
+                    ui.selectable_value(&mut self.selected_iface, i, label);
+                }
+            });
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(theme::micro_label(
+                    "USERNAME (OPTIONAL)",
+                    theme::LABEL_ON_PAPER,
+                ));
+                ui.add_sized(
+                    [200.0, 28.0],
+                    egui::TextEdit::singleline(&mut self.username),
+                );
+            });
+            ui.vertical(|ui| {
+                ui.label(theme::micro_label(
+                    "PASSWORD (OPTIONAL)",
+                    theme::LABEL_ON_PAPER,
+                ));
+                ui.add_sized(
+                    [200.0, 28.0],
+                    egui::TextEdit::singleline(&mut self.password).password(true),
+                );
+            });
+        });
+        // REQ-6: one-line plaintext-storage hint above credentials.
+        ui.label(theme::micro_label(
+            "CREDENTIALS ARE STORED IN PLAINTEXT INSIDE CAMERAS.TOML",
+            theme::LABEL_ON_PAPER,
+        ));
+
+        ui.add_space(12.0);
+        if theme::brutal_button_sized(
+            ui,
+            egui::vec2(ui.available_width(), 34.0),
+            "SCAN",
+            BtnVariant::Ink,
+        ) {
+            *action = DiscoverAction::Scan;
+        }
+    }
+
+    fn show_scanning(&mut self, ui: &mut egui::Ui, action: &mut DiscoverAction) {
+        ui.add_space(4.0);
+        match &self.latest {
+            Some(snap) => ui.label(theme::micro_label(
+                format!(
+                    "HOSTS {}/{} \u{b7} RESPONDERS {} \u{b7} PROBES {}/{}",
+                    snap.hosts_scanned.min(snap.hosts_total),
+                    snap.hosts_total,
+                    snap.responders_found,
+                    snap.probes_done,
+                    snap.probes_total
+                ),
+                theme::LABEL_ON_PAPER,
+            )),
+            None => ui.label(theme::micro_label(
+                "STARTING DISCOVERY\u{2026}",
+                theme::LABEL_ON_PAPER,
+            )),
+        };
+        self.maybe_ws_hint(ui);
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                discover_rows_ui(ui, &mut self.rows);
+            });
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if self.cancelling {
+                ui.label(theme::micro_label(
+                    "CANCELLING\u{2026}",
+                    theme::LABEL_ON_PAPER,
+                ));
+            } else if theme::brutal_button(ui, "CANCEL", BtnVariant::Danger) {
+                *action = DiscoverAction::Cancel;
+            }
+        });
+    }
+
+    fn show_results(&mut self, ui: &mut egui::Ui, action: &mut DiscoverAction) {
+        ui.add_space(4.0);
+        let selected = self
+            .rows
+            .iter()
+            .filter(|row| row.checked && row.addable())
+            .count();
+        ui.label(theme::micro_label(
+            format!(
+                "{} DEVICE(S) FOUND \u{b7} {} SELECTED",
+                self.rows.len(),
+                selected
+            ),
+            theme::LABEL_ON_PAPER,
+        ));
+        self.maybe_ws_hint(ui);
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                discover_rows_ui(ui, &mut self.rows);
+            });
+
+        ui.add_space(12.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Disabled (unclickable) when nothing addable is ticked (REQ-13).
+            let can_add = selected > 0;
+            let variant = if can_add {
+                BtnVariant::Ink
+            } else {
+                BtnVariant::Paper
+            };
+            let clicked = ui
+                .scope(|ui| {
+                    if !can_add {
+                        ui.disable();
+                    }
+                    theme::brutal_button_sized(ui, egui::vec2(170.0, 34.0), "ADD SELECTED", variant)
+                })
+                .inner;
+            if clicked {
+                *action = DiscoverAction::AddSelected;
+            }
+            if theme::brutal_button(ui, "< BACK", BtnVariant::Paper) {
+                *action = DiscoverAction::Back;
+            }
+        });
+    }
+
+    fn maybe_ws_hint(&self, ui: &mut egui::Ui) {
+        let Some((found, degraded)) = self.ws else {
+            return;
+        };
+        let results_empty = self
+            .latest
+            .as_ref()
+            .is_none_or(|snap| snap.results.is_empty());
+        if degraded || (found == 0 && results_empty) {
+            ui.label(theme::micro_label(
+                "FOUND 0 VIA ONVIF \u{b7} FIREWALL?",
+                theme::LABEL_ON_PAPER,
+            ));
+        }
+    }
+
+    /// Containing-/24 label for the picker (REQ-1 clamp scenario).
+    fn subnet_label(&self, index: usize) -> String {
+        match self.interfaces.get(index) {
+            Some(interface) => match net::subnet_of(interface.ip, 24) {
+                Some(subnet) => {
+                    format!(
+                        "{}/24 \u{b7} {}",
+                        Ipv4Addr::from(subnet.network),
+                        interface.name
+                    )
+                }
+                None => format!("{} \u{b7} {}", interface.ip, interface.name),
+            },
+            None => String::from("\u{2014}"),
+        }
+    }
+}
+
+fn discover_rows_ui(ui: &mut egui::Ui, rows: &mut [DiscoverRow]) {
+    for row in rows {
+        discover_row_card(ui, row);
+        ui.add_space(8.0);
+    }
+}
+
+fn discover_row_card(ui: &mut egui::Ui, row: &mut DiscoverRow) {
+    egui::Frame::new()
+        .fill(theme::PAPER_2)
+        .stroke(egui::Stroke::new(2.0_f32, theme::INK))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // REQ-10 binding semantics: warning-dot hosts are NOT addable.
+                ui.add_enabled(
+                    row.addable(),
+                    egui::Checkbox::without_text(&mut row.checked),
+                );
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(dot, 0.0, auth_color(row.result.auth));
+                ui.painter().rect_stroke(
+                    dot,
+                    0.0,
+                    egui::Stroke::new(1.0_f32, theme::PAPER.gamma_multiply(0.25)),
+                    egui::StrokeKind::Inside,
+                );
+
+                ui.vertical(|ui| {
+                    let headline = match &row.result.vendor {
+                        Some(vendor) => {
+                            format!("{} \u{b7} {}", row.result.ip, vendor.to_uppercase())
+                        }
+                        None => row.result.ip.to_string(),
+                    };
+                    ui.label(
+                        egui::RichText::new(headline)
+                            .font(theme::mono_font(12.5))
+                            .color(theme::INK),
+                    );
+                    let detail = match (&row.result.url, row.result.resolution) {
+                        (Some(url), Some((w, h))) => format!("{url}  \u{b7}  {w}\u{d7}{h}"),
+                        (Some(url), None) => url.clone(),
+                        (None, _) => {
+                            String::from("NO WORKING URL \u{2014} AUTHENTICATION REQUIRED")
+                        }
+                    };
+                    let shown = theme::elide_to_width(
+                        ui.painter(),
+                        &detail,
+                        theme::mono_font(10.0),
+                        ui.available_width(),
+                        theme::LABEL_ON_PAPER,
+                    );
+                    ui.label(theme::micro_label(shown, theme::LABEL_ON_PAPER));
+                    if row.exact_duplicate {
+                        ui.label(theme::micro_label(
+                            "ALREADY CONFIGURED",
+                            theme::LABEL_ON_PAPER,
+                        ));
+                    } else if row.duplicate {
+                        ui.label(theme::micro_label(
+                            "SAME HOST ALREADY CONFIGURED",
+                            theme::LABEL_ON_PAPER,
+                        ));
+                    }
+                });
+            });
+        });
+}
+
+/// Auth-status dot color per REQ-10 / design mapping.
+fn auth_color(auth: AuthStatus) -> egui::Color32 {
+    match auth {
+        AuthStatus::Authenticated | AuthStatus::Open => theme::STATUS_ONLINE,
+        AuthStatus::NeedsCredentials => theme::STATUS_CONNECTING,
+    }
+}
+
+/// Inline error banner shared by Settings and Discover (dot + red mono text).
+fn error_line(ui: &mut egui::Ui, err: &str) {
+    ui.horizontal(|ui| {
+        let (block, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().rect_filled(block, 0.0, theme::STATUS_OFFLINE);
+        ui.label(
+            egui::RichText::new(err.to_string())
+                .font(theme::mono_font(10.0))
+                .color(theme::STATUS_OFFLINE),
+        );
+    });
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SidebarAction {
     None,
     Grid,
+    Discover,
     Settings,
     Solo(usize),
+}
+
+/// User intent produced by one frame of the discover wizard panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoverAction {
+    None,
+    Scan,
+    Cancel,
+    Back,
+    AddSelected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +753,7 @@ pub struct CamViewerApp {
     view: View,
     focus: FocusTracker,
     settings: SettingsEditor,
+    discover: Option<DiscoverWizard>,
     badge_position: BadgePosition,
 }
 
@@ -172,6 +778,7 @@ impl CamViewerApp {
             },
             focus: FocusTracker::new(),
             settings: SettingsEditor::from_config(config),
+            discover: None,
             badge_position: config.badge_position,
         }
     }
@@ -188,16 +795,58 @@ impl CamViewerApp {
     fn open_settings(&mut self) {
         self.settings = SettingsEditor::from_config(&Config {
             badge_position: self.badge_position,
-            cameras: self
-                .cameras
-                .iter()
-                .map(|cam| CameraConfig {
-                    name: cam.name.clone(),
-                    url: cam.url.clone(),
-                })
-                .collect(),
+            cameras: self.camera_configs(),
         });
         self.view = View::Settings;
+    }
+
+    fn camera_configs(&self) -> Vec<CameraConfig> {
+        self.cameras
+            .iter()
+            .map(|cam| CameraConfig {
+                name: cam.name.clone(),
+                url: cam.url.clone(),
+            })
+            .collect()
+    }
+
+    /// Single source of truth for persisting a camera list and (re)spawning
+    /// streams (REQ-14): `config::save` + `apply_cameras` + navigate to Grid.
+    /// On failure nothing is mutated and the error names the cause; the
+    /// caller stays where it was. `cameras` is the COMPLETE desired list —
+    /// existing streams are reused by URL equality, so unchanged cameras
+    /// never restart.
+    ///
+    /// Deviation from the task sketch (`extra` param with internal merge):
+    /// merging lives in the tested `merge_cameras` helper at the discovery
+    /// call site, because a settings save REPLACES the list (renames and
+    /// deletions cannot be expressed as "+extra" against the current list).
+    fn commit_cameras(
+        &mut self,
+        badge_position: BadgePosition,
+        cameras: Vec<CameraConfig>,
+    ) -> Result<(), String> {
+        config::save(
+            &config::config_path(),
+            &Config {
+                badge_position,
+                cameras: cameras.clone(),
+            },
+        )
+        .map_err(|err| format!("Failed to save config: {err:#}"))?;
+        self.badge_position = badge_position;
+        self.apply_cameras(cameras);
+        self.view = View::Grid;
+        Ok(())
+    }
+
+    fn save_settings(&mut self) {
+        self.settings.error = None;
+        let desired = self.settings.collect();
+        let badge_position = self.settings.badge_position;
+        if let Err(err) = self.commit_cameras(badge_position, desired) {
+            self.settings.error = Some(err);
+        }
     }
 
     fn cancel_settings(&mut self) {
@@ -205,23 +854,52 @@ impl CamViewerApp {
         self.view = View::Grid;
     }
 
-    fn save_settings(&mut self) {
-        self.settings.error = None;
-        let desired = self.settings.collect();
-        let badge_position = self.settings.badge_position;
-        if let Err(err) = config::save(
-            &config::config_path(),
-            &Config {
-                badge_position,
-                cameras: desired.clone(),
-            },
-        ) {
-            self.settings.error = Some(format!("Failed to save config: {err:#}"));
-            return;
+    /// REQ-12: entering Discover starts fresh at Idle. Leaving through any
+    /// route ends the wizard via [`CamViewerApp::abandon_discover`].
+    fn open_discover(&mut self) {
+        self.discover = Some(DiscoverWizard::new());
+        self.view = View::Discover;
+    }
+
+    /// Task 6.3 / spec REQ-4: leaving Discover through ANY route (GRID VIEW,
+    /// SETTINGS, sidebar SOLO rows, tile clicks, Escape) ends the wizard with
+    /// Escape's guarantees — workers cancelled, no orphaned threads or late
+    /// writes, cameras.toml untouched — while the blocking join runs on a
+    /// detached closer thread instead of the UI thread.
+    fn abandon_discover(&mut self) {
+        if let Some(mut wizard) = self.discover.take() {
+            wizard.end_detached();
         }
-        self.badge_position = badge_position;
-        self.apply_cameras(desired);
+    }
+
+    fn close_discover(&mut self) {
+        self.abandon_discover();
         self.view = View::Grid;
+    }
+
+    /// REQ-14 merge: build entries from checked addable rows, dedup against
+    /// the current config by exact URL, persist through the shared commit
+    /// path. Save failure keeps the wizard in Results with the selection
+    /// intact and no navigation.
+    fn add_selected(&mut self) {
+        let existing = self.camera_configs();
+        let extra = self
+            .discover
+            .as_ref()
+            .map(|wizard| selected_cameras(&wizard.rows, existing.len()))
+            .unwrap_or_default();
+        if extra.is_empty() {
+            return; // Verified no-op guard (REQ-13 empty-selection scenario).
+        }
+        let merged = merge_cameras(&existing, extra);
+        match self.commit_cameras(self.badge_position, merged) {
+            Ok(()) => self.discover = None, // commit navigated to Grid (REQ-15).
+            Err(err) => {
+                if let Some(wizard) = self.discover.as_mut() {
+                    wizard.error = Some(err);
+                }
+            }
+        }
     }
 
     fn apply_cameras(&mut self, desired: Vec<CameraConfig>) {
@@ -258,6 +936,15 @@ impl CamViewerApp {
 
 impl eframe::App for CamViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Discovery snapshot polling at the very top of update (REQ-4): live
+        // progress rides the global 50ms repaint cadence — no new timers.
+        if matches!(self.view, View::Discover) {
+            let existing = self.camera_configs();
+            if let Some(wizard) = self.discover.as_mut() {
+                wizard.poll(&existing);
+            }
+        }
+
         let active = ctx.input(|i| {
             let viewport = i.viewport();
             viewport.focused.unwrap_or(true) && !viewport.minimized.unwrap_or(false)
@@ -273,13 +960,24 @@ impl eframe::App for CamViewerApp {
         if matches!(self.view, View::Settings) && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.cancel_settings();
         }
+        // Escape leaves Discover; dropping the wizard cancels any scan.
+        if matches!(self.view, View::Discover) && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.close_discover();
+        }
 
         let sidebar = show_sidebar(ctx, &self.view, &self.cameras);
         match sidebar {
             SidebarAction::Grid => self.view = View::Grid,
+            SidebarAction::Discover => self.open_discover(),
             SidebarAction::Settings => self.open_settings(),
             SidebarAction::Solo(index) => self.view = View::Solo(index),
             SidebarAction::None => {}
+        }
+        // Task 6.3 / REQ-4: any route out of Discover ends the wizard with
+        // the Escape guarantees; keyed on the view rather than enumerated
+        // routes so no transition can bypass it.
+        if self.discover.is_some() && !matches!(self.view, View::Discover) {
+            self.abandon_discover();
         }
 
         match self.view {
@@ -294,6 +992,32 @@ impl eframe::App for CamViewerApp {
                     || show_solo(ctx, &mut self.cameras[index], paused, self.badge_position)
                 {
                     self.view = View::Grid;
+                }
+            }
+            View::Discover => {
+                let action = self
+                    .discover
+                    .as_mut()
+                    .map(|wizard| wizard.show(ctx))
+                    .unwrap_or(DiscoverAction::None);
+                match action {
+                    DiscoverAction::Scan => {
+                        if let Some(wizard) = self.discover.as_mut() {
+                            wizard.start_scan();
+                        }
+                    }
+                    DiscoverAction::Cancel => {
+                        if let Some(wizard) = self.discover.as_mut() {
+                            wizard.request_cancel();
+                        }
+                    }
+                    DiscoverAction::Back => {
+                        if let Some(wizard) = self.discover.as_mut() {
+                            wizard.back_to_idle();
+                        }
+                    }
+                    DiscoverAction::AddSelected => self.add_selected(),
+                    DiscoverAction::None => {}
                 }
             }
             View::Settings => match show_settings(ctx, &mut self.settings) {
@@ -363,7 +1087,7 @@ fn show_sidebar(ctx: &egui::Context, view: &View, cameras: &[CameraView]) -> Sid
             ));
             ui.add_space(14.0);
 
-            let grid_active = !matches!(view, View::Settings);
+            let grid_active = matches!(view, View::Grid | View::Solo(_));
             if theme::nav_item(
                 ui,
                 "GRID VIEW",
@@ -372,6 +1096,12 @@ fn show_sidebar(ctx: &egui::Context, view: &View, cameras: &[CameraView]) -> Sid
             ) && !grid_active
             {
                 action = SidebarAction::Grid;
+            }
+            ui.add_space(6.0);
+            if theme::nav_item(ui, "DISCOVER", None, matches!(view, View::Discover))
+                && !matches!(view, View::Discover)
+            {
+                action = SidebarAction::Discover;
             }
             ui.add_space(6.0);
             if theme::nav_item(ui, "SETTINGS", None, matches!(view, View::Settings))
@@ -879,16 +1609,7 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
             ui.add_space(8.0);
 
             if let Some(err) = &editor.error {
-                ui.horizontal(|ui| {
-                    let (block, _) =
-                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().rect_filled(block, 0.0, theme::STATUS_OFFLINE);
-                    ui.label(
-                        egui::RichText::new(err.to_string())
-                            .font(theme::mono_font(10.0))
-                            .color(theme::STATUS_OFFLINE),
-                    );
-                });
+                error_line(ui, err);
                 ui.add_space(4.0);
             }
 
@@ -1100,6 +1821,188 @@ fn fit_rect(rect: egui::Rect, w: f32, h: f32) -> egui::Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discover::AuthStatus;
+    use std::net::Ipv4Addr;
+
+    fn result(ip: [u8; 4], url: Option<&str>, auth: AuthStatus) -> DiscoveryResult {
+        DiscoveryResult {
+            ip: Ipv4Addr::from(ip),
+            url: url.map(str::to_owned),
+            vendor: None,
+            resolution: None,
+            auth,
+        }
+    }
+
+    fn camera(name: &str, url: &str) -> CameraConfig {
+        CameraConfig {
+            name: name.to_owned(),
+            url: url.to_owned(),
+        }
+    }
+
+    #[test]
+    fn url_host_strips_scheme_userinfo_port_and_path() {
+        assert_eq!(
+            url_host("rtsp://admin:s3cret@192.168.1.64:554/Streaming/Channels/101").as_deref(),
+            Some("192.168.1.64")
+        );
+        assert_eq!(
+            url_host("rtsp://192.168.1.10/live").as_deref(),
+            Some("192.168.1.10")
+        );
+        assert_eq!(
+            url_host("rtsp://user:p@ss@10.0.0.5:8554/onvif1").as_deref(),
+            Some("10.0.0.5")
+        );
+        assert_eq!(url_host("not-a-url"), None);
+    }
+
+    #[test]
+    fn global_creds_require_username_and_trim_both_fields() {
+        assert_eq!(global_creds("", ""), None);
+        assert_eq!(global_creds("   ", "s3cret"), None);
+        assert_eq!(global_creds("", "s3cret"), None);
+        assert_eq!(
+            global_creds(" admin ", " s3cret "),
+            Some(("admin".to_owned(), "s3cret".to_owned()))
+        );
+        // Blank passwords are legal in rtsp://user:@host URLs.
+        assert_eq!(
+            global_creds("admin", ""),
+            Some(("admin".to_owned(), String::new()))
+        );
+    }
+
+    #[test]
+    fn merge_cameras_appends_new_and_skips_exact_url_duplicates() {
+        let existing = vec![camera("Front", "rtsp://192.168.1.10/live")];
+        let extra = vec![
+            camera("Back", "rtsp://192.168.1.11/live"),
+            // Exact duplicate of an existing URL: dropped.
+            camera("Front copy", "rtsp://192.168.1.10/live"),
+            // Exact duplicate within extra itself: first wins.
+            camera("Back 2", "rtsp://192.168.1.11/live"),
+        ];
+        let merged = merge_cameras(&existing, extra);
+        assert_eq!(
+            merged,
+            vec![
+                camera("Front", "rtsp://192.168.1.10/live"),
+                camera("Back", "rtsp://192.168.1.11/live"),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovered_name_uses_vendor_guess_or_sequential_fallback() {
+        let ip = Ipv4Addr::new(192, 168, 1, 64);
+        assert_eq!(
+            discovered_name(Some("Hikvision".to_owned()).as_deref(), ip, 3),
+            "Hikvision 192.168.1.64"
+        );
+        assert_eq!(discovered_name(None, ip, 3), "Cam 3");
+    }
+
+    #[test]
+    fn selected_cameras_collects_only_checked_addable_rows_with_names() {
+        let mut hit = DiscoverRow::new(result(
+            [192, 168, 1, 64],
+            Some("rtsp://192.168.1.64:554/x"),
+            AuthStatus::Authenticated,
+        ));
+        hit.result.vendor = Some("Hikvision".to_owned());
+        hit.checked = true;
+        let unchecked = DiscoverRow::new(result(
+            [192, 168, 1, 65],
+            Some("rtsp://192.168.1.65/y"),
+            AuthStatus::Open,
+        ));
+        let mut already = DiscoverRow::new(result(
+            [192, 168, 1, 66],
+            Some("rtsp://192.168.1.66/z"),
+            AuthStatus::Authenticated,
+        ));
+        already.checked = true;
+        already.duplicate = true;
+        already.exact_duplicate = true;
+        let mut needs_creds = DiscoverRow::new(result(
+            [192, 168, 1, 67],
+            None,
+            AuthStatus::NeedsCredentials,
+        ));
+        needs_creds.checked = true;
+
+        let rows = vec![hit, unchecked, already, needs_creds];
+        assert_eq!(
+            selected_cameras(&rows, 2),
+            vec![camera(
+                "Hikvision 192.168.1.64",
+                "rtsp://192.168.1.64:554/x"
+            )]
+        );
+    }
+
+    #[test]
+    fn reconcile_rows_creates_unchecked_rows_and_flags_duplicates() {
+        let existing = vec![
+            camera("Front", "rtsp://192.168.1.10:554/live"),
+            camera("Garage", "rtsp://admin:pw@192.168.1.20:8554/open"),
+        ];
+        let results = vec![
+            result(
+                [192, 168, 1, 10],
+                Some("rtsp://192.168.1.10:554/live"),
+                AuthStatus::Open,
+            ),
+            result(
+                [192, 168, 1, 20],
+                Some("rtsp://192.168.1.20:554/onvif1"),
+                AuthStatus::Authenticated,
+            ),
+            result([192, 168, 1, 40], None, AuthStatus::NeedsCredentials),
+        ];
+        let mut rows = Vec::new();
+        reconcile_rows(&mut rows, &results, &existing);
+
+        assert_eq!(rows.len(), 3);
+        // Exact-string URL match against a configured camera.
+        assert!(rows[0].duplicate && rows[0].exact_duplicate && !rows[0].checked);
+        // Same host as a configured camera but a different URL: only
+        // informational.
+        assert!(rows[1].duplicate && !rows[1].exact_duplicate && !rows[1].checked);
+        assert!(!rows[2].duplicate && !rows[2].checked);
+    }
+
+    #[test]
+    fn reconcile_rows_preserves_checked_state_across_frames_and_drops_gone_results() {
+        let existing = vec![];
+        let first = vec![
+            result(
+                [192, 168, 1, 30],
+                Some("rtsp://192.168.1.30/a"),
+                AuthStatus::Open,
+            ),
+            result(
+                [192, 168, 1, 31],
+                Some("rtsp://192.168.1.31/b"),
+                AuthStatus::Open,
+            ),
+        ];
+        let mut rows = Vec::new();
+        reconcile_rows(&mut rows, &first, &existing);
+        rows[0].checked = true;
+
+        // Same frame-by-frame refresh with identical results: checkbox kept.
+        reconcile_rows(&mut rows, &first, &existing);
+        assert!(rows[0].checked);
+
+        // A later snapshot carrying fewer results drops vanished rows.
+        let later = vec![first[1].clone()];
+        reconcile_rows(&mut rows, &later, &existing);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].result.ip, Ipv4Addr::new(192, 168, 1, 31));
+    }
 
     #[test]
     fn pauses_only_after_grace_period_then_resumes_on_focus() {
@@ -1167,5 +2070,95 @@ mod tests {
             FocusChange::EnteredPause
         );
         assert!(tracker.paused());
+    }
+
+    /// Live pipeline against TEST-NET-1 (RFC 5737, silently unroutable):
+    /// real worker threads, zero network side effects, CI-safe.
+    fn live_scan_wizard() -> DiscoverWizard {
+        let mut wizard = DiscoverWizard {
+            interfaces: Vec::new(),
+            selected_iface: 0,
+            username: String::new(),
+            password: String::new(),
+            handle: None,
+            latest: None,
+            rows: Vec::new(),
+            error: None,
+            cancelling: false,
+            ws: None,
+        };
+        wizard.handle = Some(DiscoveryHandle::start(DiscoveryConfig {
+            subnet: net::Subnet {
+                network: Ipv4Addr::new(192, 0, 2, 0).to_bits(),
+                prefix: 24,
+            },
+            ports: vec![9],
+            creds: None,
+            probe_timeout: Duration::from_millis(250),
+        }));
+        wizard
+    }
+
+    fn headless_app() -> CamViewerApp {
+        CamViewerApp::new(&Config::default())
+    }
+
+    #[test]
+    fn end_detached_releases_a_live_pipeline_without_blocking_the_caller() {
+        let mut wizard = live_scan_wizard();
+
+        let started = Instant::now();
+        wizard.end_detached();
+        let elapsed = started.elapsed();
+        assert!(wizard.handle.is_none());
+        // A synchronous Drop-join of this pipeline costs at least one 250 ms
+        // wsdiscovery poll tick plus scan wind-down; the closer thread must
+        // absorb that instead of the caller.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "end_detached blocked its caller for {elapsed:?}"
+        );
+
+        // Idempotent: no second handle, instant no-op.
+        let again = Instant::now();
+        wizard.end_detached();
+        assert!(again.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn close_discover_ends_the_wizard_and_navigates_to_grid_without_blocking() {
+        let mut app = headless_app();
+        app.view = View::Discover;
+        app.discover = Some(live_scan_wizard());
+
+        let started = Instant::now();
+        app.close_discover();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "close_discover blocked its caller"
+        );
+        assert!(app.discover.is_none());
+        assert!(matches!(app.view, View::Grid));
+    }
+
+    #[test]
+    fn abandon_discover_cancels_an_in_flight_scan_from_any_non_discover_view() {
+        for view in [View::Grid, View::Solo(0), View::Settings] {
+            let mut app = headless_app();
+            app.view = view;
+            app.discover = Some(live_scan_wizard());
+
+            let started = Instant::now();
+            app.abandon_discover();
+
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "abandon_discover blocked its caller"
+            );
+            assert!(app.discover.is_none());
+            // Navigation itself stays untouched; only the wizard ends.
+            assert!(!matches!(app.view, View::Discover));
+        }
     }
 }
