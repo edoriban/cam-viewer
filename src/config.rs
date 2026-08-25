@@ -5,6 +5,18 @@ use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "cameras.toml";
 
+/// Corner of grid tiles where the status badge is drawn.
+///
+/// Declared scalar-first in [`Config`] so TOML serialization keeps plain keys
+/// ahead of the `[[cameras]]` array-of-tables.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BadgePosition {
+    TopRight,
+    #[default]
+    BottomRight,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CameraConfig {
     pub name: String,
@@ -13,6 +25,8 @@ pub struct CameraConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub badge_position: BadgePosition,
     pub cameras: Vec<CameraConfig>,
 }
 
@@ -39,8 +53,7 @@ pub fn serialize(config: &Config) -> Result<String> {
 
 pub fn save(path: &Path, config: &Config) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let serialized = serialize(config)?;
     fs::write(path, serialized).with_context(|| format!("writing {}", path.display()))?;
@@ -53,8 +66,7 @@ pub fn load(path: &Path) -> Result<Config> {
         save(path, &default)?;
         return Ok(default);
     }
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let cfg: Config =
         toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     Ok(cfg)
@@ -66,6 +78,7 @@ mod tests {
 
     fn sample() -> Config {
         Config {
+            badge_position: BadgePosition::BottomRight,
             cameras: vec![
                 CameraConfig {
                     name: "Front".to_owned(),
@@ -114,5 +127,52 @@ mod tests {
         assert!(loaded.cameras.is_empty());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_toml_without_badge_position_defaults_to_bottom_right() {
+        let raw = "[[cameras]]\nname = \"Front\"\nurl = \"rtsp://192.168.1.10/live\"\n";
+        let parsed: Config = toml::from_str(raw).expect("parse legacy config");
+        assert_eq!(parsed.badge_position, BadgePosition::BottomRight);
+        assert_eq!(parsed.cameras.len(), 1);
+
+        // The same legacy file must also survive a load through the public API.
+        let root = std::env::temp_dir().join(format!("cam-viewer-legacy-{}", std::process::id()));
+        let path = root.join(FILE_NAME);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create dir");
+        fs::write(&path, raw).expect("write legacy config");
+
+        let loaded = load(&path).expect("load legacy config");
+        assert_eq!(loaded.badge_position, BadgePosition::BottomRight);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saved_toml_emits_badge_position_before_cameras_table_and_round_trips() {
+        for position in [BadgePosition::TopRight, BadgePosition::BottomRight] {
+            let cfg = Config {
+                badge_position: position,
+                cameras: sample().cameras,
+            };
+            let raw = serialize(&cfg).expect("serialize");
+
+            let badge_idx = raw
+                .find("badge_position")
+                .expect("badge_position key emitted");
+            let cameras_idx = raw.find("[[cameras]]").expect("cameras table emitted");
+            assert!(
+                badge_idx < cameras_idx,
+                "scalar key must precede the array-of-tables header:\n{raw}"
+            );
+            assert!(
+                raw.contains("badge_position = \"top-right\"")
+                    == (position == BadgePosition::TopRight)
+            );
+
+            let parsed: Config = toml::from_str(&raw).expect("re-parse saved config");
+            assert_eq!(parsed, cfg);
+        }
     }
 }

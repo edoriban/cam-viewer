@@ -93,7 +93,9 @@ impl Drop for StreamHandle {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn stop_child(child_slot: &Mutex<Option<Child>>) {
@@ -154,11 +156,7 @@ fn run_loop(shared: Shared, url: &str) {
                 *lock(&shared.status) = Status::Paused;
             }
             let _ = probe(url);
-            sleep_interruptible(
-                &shared.shutdown,
-                &shared.paused,
-                PAUSED_PROBE_INTERVAL,
-            );
+            sleep_interruptible(&shared.shutdown, &shared.paused, PAUSED_PROBE_INTERVAL);
             continue;
         }
         paused_seen = false;

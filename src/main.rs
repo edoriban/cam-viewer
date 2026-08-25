@@ -21,6 +21,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "cam-viewer",
         options,
-        Box::new(move |_cc| Ok(Box::new(CamViewerApp::new(&cfg)))),
+        Box::new(move |cc| {
+            cam_viewer::theme::install(&cc.egui_ctx);
+            Ok(Box::new(CamViewerApp::new(&cfg)))
+        }),
     )
 }

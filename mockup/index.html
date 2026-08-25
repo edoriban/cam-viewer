@@ -1,0 +1,1492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CAM-VIEWER — UI Mockup Spec Sheet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   CAM-VIEWER — design-system mockup
+   Language: brutalist editorial, signal-status palette
+   ============================================================ */
+
+:root {
+  /* Surfaces */
+  --soot:     #0b0b0d;
+  --soot-2:   #17161c;
+  --ink:      #14130f;
+  --ash:      #6b6a62;
+  --concrete: #b9b5aa;
+  --paper:    #ece9e0;
+  --paper-2:  #e2ded2;
+
+  /* Status colors */
+  --good: #00b050;
+  --mod:  #ffd200;
+  --bad:  #e30613;
+
+  /* Status mapping */
+  --st-online:     var(--good);
+  --st-connecting: var(--mod);
+  --st-offline:    var(--bad);
+  --st-paused:     var(--ash);
+
+  --hard:    6px 6px 0 0 var(--ink);
+  --hard-sm: 4px 4px 0 0 var(--ink);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--soot);
+  color: var(--paper);
+  font-family: "Newsreader", Georgia, serif;
+  font-size: 17px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Film-grain atmosphere over the soot void */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  pointer-events: none;
+  opacity: .045;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+::selection { background: var(--bad); color: #ffffff; }
+
+:focus-visible { outline: 2px solid var(--mod); outline-offset: 2px; }
+
+img, svg { display: block; max-width: 100%; }
+
+a { color: inherit; }
+
+button { font: inherit; cursor: pointer; }
+
+/* ---------- Type utilities ---------- */
+
+.label {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: .7rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: .14em;
+}
+
+.display {
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 700;
+  letter-spacing: -.02em;
+  line-height: 1.02;
+  text-transform: uppercase;
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 12px;
+  z-index: 1000;
+  background: var(--paper);
+  color: var(--ink);
+  padding: 10px 16px;
+  border: 2px solid var(--ink);
+}
+.skip-link:focus { left: 12px; }
+
+/* ============================================================
+   SITE HEADER
+   ============================================================ */
+
+.site-head {
+  background: var(--soot);
+  border-bottom: 3px solid var(--paper);
+}
+
+.head-row {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 26px 24px 22px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .95rem;
+  font-weight: 700;
+  letter-spacing: .22em;
+  color: var(--paper);
+  text-decoration: none;
+}
+
+.wm-block {
+  width: 14px;
+  height: 14px;
+  background: var(--bad);
+  border: 2px solid var(--paper);
+  flex: none;
+}
+
+.head-tag {
+  color: var(--concrete);
+  font-style: italic;
+  font-size: 1rem;
+}
+
+.head-meta {
+  display: flex;
+  gap: 20px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.head-meta .label { color: var(--ash); }
+
+.head-nav {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+
+.head-nav a {
+  font-family: "JetBrains Mono", monospace;
+  font-size: .68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .14em;
+  text-decoration: none;
+  color: var(--paper);
+  border: 2px solid var(--concrete);
+  padding: 7px 12px;
+  background: var(--soot);
+}
+.head-nav a:hover { background: var(--paper); color: var(--ink); border-color: var(--paper); }
+
+/* ============================================================
+   PAGE FRAME — paper plates floating on the soot void
+   ============================================================ */
+
+main {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 48px 20px 64px;
+  display: grid;
+  gap: 48px;
+}
+
+.plate {
+  background: var(--paper);
+  color: var(--ink);
+  border: 2px solid var(--ink);
+  box-shadow: var(--hard);
+  padding: clamp(20px, 4vw, 40px);
+}
+
+.plate-head {
+  border-top: 3px solid var(--ink);
+  padding-top: 14px;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.plate-index {
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 700;
+  font-size: clamp(40px, 6vw, 64px);
+  line-height: .9;
+  letter-spacing: -.03em;
+}
+.plate-index em { font-style: normal; color: var(--bad); }
+
+.plate-meta { color: var(--ash); text-align: right; }
+
+.plate h2 {
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: -.015em;
+  font-size: clamp(26px, 4vw, 40px);
+  line-height: 1;
+  margin: 10px 0 14px;
+}
+
+.annotation {
+  font-style: italic;
+  max-width: 66ch;
+  color: #33322b;
+  margin-bottom: 28px;
+}
+
+.board {
+  background: var(--paper-2);
+  border: 2px solid var(--ink);
+  padding: clamp(14px, 2.5vw, 26px);
+}
+
+/* ============================================================
+   SHARED APP CHROME (dark frames mounted inside plates)
+   ============================================================ */
+
+.app-frame {
+  background: var(--soot);
+  border: 2px solid var(--ink);
+  box-shadow: var(--hard-sm);
+  display: grid;
+  grid-template-columns: 272px 1fr;
+  text-align: left;
+}
+
+/* ---------- Sidebar ---------- */
+
+.side {
+  border-right: 2px solid var(--concrete);
+  padding: 20px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
+}
+
+.side-mark {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .78rem;
+  font-weight: 700;
+  letter-spacing: .2em;
+  color: var(--paper);
+}
+
+.side-mark .wm-block { border-color: var(--ink); }
+
+.side-sub { color: var(--ash); border-top: 1px solid var(--soot-2); padding-top: 12px; }
+
+.side-nav { display: flex; flex-direction: column; gap: 6px; }
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .14em;
+  text-decoration: none;
+  color: var(--concrete);
+  border: 2px solid var(--concrete);
+  padding: 10px 12px;
+}
+.nav-item:hover { background: var(--soot-2); color: var(--paper); }
+.nav-item.is-active {
+  background: var(--paper);
+  border-color: var(--paper);
+  color: var(--ink);
+  box-shadow: 3px 3px 0 0 var(--bad);
+}
+.nav-count { color: inherit; opacity: .65; font-weight: 400; }
+
+.cam-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  margin-top: 2px;
+}
+
+.cam-list-title { color: var(--ash); margin-bottom: 10px; }
+
+.cam-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 8px;
+  border-top: 1px solid var(--soot-2);
+  min-width: 0;
+}
+.cam-row:hover { background: var(--soot-2); }
+.cam-row.is-here { background: var(--soot-2); box-shadow: inset 3px 0 0 0 var(--paper); }
+
+.dot {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border: 1px solid rgba(236, 233, 224, .25);
+}
+.d-online     { background: var(--st-online); }
+.d-connecting { background: var(--st-connecting); animation: blink 1.6s steps(2, start) infinite; }
+.d-offline    { background: var(--st-offline); }
+.d-paused     { background: var(--st-paused); }
+
+.cam-name {
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 500;
+  font-size: .92rem;
+  color: var(--paper);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.cam-state {
+  margin-left: auto;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .62rem;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ash);
+  flex: none;
+}
+
+.s-online     { color: var(--st-online); }
+.s-connecting { color: var(--st-connecting); }
+.s-offline    { color: var(--st-offline); }
+.s-paused     { color: var(--st-paused); }
+
+/* ---------- Buttons ---------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .14em;
+  text-decoration: none;
+  color: var(--ink);
+  background: var(--paper);
+  border: 2px solid var(--ink);
+  box-shadow: var(--hard-sm);
+  padding: 10px 14px;
+  transition: transform .08s ease, box-shadow .08s ease;
+}
+.btn:hover { transform: translate(-2px, -2px); box-shadow: 6px 6px 0 0 var(--ink); }
+.btn:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 0 var(--ink); }
+.btn-primary { background: var(--ink); color: var(--paper); }
+.btn-danger  { color: var(--bad); }
+.btn-danger:hover { background: var(--bad); color: #ffffff; }
+.btn-ghost { box-shadow: none; }
+.btn-ghost:hover { transform: none; box-shadow: var(--hard-sm); }
+
+/* ============================================================
+   02 — GRID VIEW
+   ============================================================ */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 16px 18px;
+  border-bottom: 2px solid var(--concrete);
+}
+
+.toolbar-title {
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 600;
+  font-size: 1.05rem;
+  text-transform: uppercase;
+  letter-spacing: -.01em;
+  color: var(--paper);
+}
+
+.toolbar-count { color: var(--ash); margin-left: 12px; }
+
+.toolbar-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.toolbar-actions .btn { box-shadow: none; background: var(--soot); color: var(--paper); border-color: var(--concrete); }
+.toolbar-actions .btn:hover { background: var(--paper); color: var(--ink); border-color: var(--paper); transform: none; }
+
+.tile-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 14px;
+  padding: 18px;
+}
+
+.tile {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  border: 2px solid var(--concrete);
+  background: var(--soot-2);
+  overflow: hidden;
+  min-width: 0;
+}
+
+.video-area { position: absolute; inset: 0; }
+
+/* Fake feed: gradient wash + CSS scanlines + vignette */
+.video-area::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    repeating-linear-gradient(0deg,
+      rgba(236, 233, 224, .05) 0 1px,
+      transparent 1px 3px),
+    linear-gradient(160deg, #26252f 0%, var(--soot-2) 46%, #0c0c10 100%);
+}
+.video-area::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(115% 90% at 50% 42%, transparent 52%, rgba(0, 0, 0, .55) 100%);
+}
+
+.v-offline {
+  background:
+    repeating-linear-gradient(45deg,
+      rgba(236, 233, 224, .04) 0 10px,
+      transparent 10px 20px),
+    var(--soot-2);
+}
+
+.tile > * { position: relative; z-index: 2; }
+
+.reticle {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 22px;
+  height: 22px;
+  transform: translate(-50%, -50%);
+  z-index: 1;
+  opacity: .5;
+  background:
+    linear-gradient(var(--concrete), var(--concrete)) 50% 0 / 2px 100% no-repeat,
+    linear-gradient(var(--concrete), var(--concrete)) 0 50% / 100% 2px no-repeat;
+  clip-path: polygon(0 0, 30% 0, 30% 2px, 70% 2px, 70% 0, 100% 0, 100% 30%, calc(100% - 2px) 30%, calc(100% - 2px) 70%, 100% 70%, 100% 100%, 70% 100%, 70% calc(100% - 2px), 30% calc(100% - 2px), 30% 100%, 0 100%, 0 70%, 2px 70%, 2px 30%, 0 30%);
+}
+
+.tile-top {
+  position: absolute;
+  inset: 0 0 auto 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+.tile-id { display: grid; gap: 2px; min-width: 0; }
+
+.tile-cam-noise {
+  font-family: "JetBrains Mono", monospace;
+  font-size: .58rem;
+  letter-spacing: .18em;
+  color: rgba(236, 233, 224, .6);
+}
+
+.tile-name {
+  font-family: "JetBrains Mono", monospace;
+  font-size: .78rem;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: #ffffff;
+  text-shadow: 1px 1px 0 rgba(11, 11, 13, .95);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.badge {
+  font-family: "JetBrains Mono", monospace;
+  font-size: .58rem;
+  font-weight: 700;
+  letter-spacing: .14em;
+  padding: 4px 8px;
+  border: 2px solid var(--ink);
+  flex: none;
+}
+.b-online     { background: var(--st-online); color: #0b0b0d; }
+.b-connecting { background: var(--st-connecting); color: #0b0b0d; }
+.b-offline    { background: var(--st-offline); color: #ffffff; }
+.b-paused     { background: var(--st-paused); color: #ffffff; }
+
+.tile-bottom {
+  position: absolute;
+  inset: auto auto 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .62rem;
+  font-weight: 500;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: #ffffff;
+  text-shadow: 1px 1px 0 rgba(11, 11, 13, .95);
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  background: var(--bad);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.live-dot.ld-connecting { background: var(--mod); animation: blink 2.2s steps(2, start) infinite; }
+.live-dot.ld-paused { background: var(--st-paused); animation: none; }
+
+.tile-ts {
+  position: absolute;
+  inset: auto 12px 10px auto;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .62rem;
+  letter-spacing: .1em;
+  color: rgba(236, 233, 224, .55);
+}
+
+.tile-ghost {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .82rem;
+  font-weight: 700;
+  letter-spacing: .34em;
+  text-transform: uppercase;
+  color: rgba(236, 233, 224, .22);
+  z-index: 1;
+}
+
+/* Reconnecting sweep line */
+.sweep {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+}
+.sweep::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 34%;
+  background: linear-gradient(180deg, transparent, rgba(255, 210, 0, .09), transparent);
+  animation: sweep 2.6s linear infinite;
+}
+
+.grid-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 0 18px 18px;
+  color: var(--ash);
+}
+
+/* ============================================================
+   03 — SOLO VIEW
+   ============================================================ */
+
+.solo-frame { display: block; }
+
+.solo-top {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding: 16px 18px;
+  border-bottom: 2px solid var(--concrete);
+}
+
+.solo-back { flex: none; }
+
+.solo-id { min-width: 0; }
+
+.solo-name {
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: -.02em;
+  font-size: clamp(24px, 4vw, 38px);
+  line-height: 1;
+  color: var(--paper);
+}
+
+.solo-path {
+  font-family: "JetBrains Mono", monospace;
+  font-size: .64rem;
+  letter-spacing: .08em;
+  color: var(--ash);
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+
+.solo-status {
+  margin-left: auto;
+  text-align: right;
+  display: grid;
+  gap: 4px;
+  justify-items: end;
+}
+.solo-status .st-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .7rem;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.st-online { color: var(--st-online); }
+
+.solo-stage { padding: 18px; }
+
+.solo-video {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  border: 2px solid var(--concrete);
+  background: var(--soot-2);
+  overflow: hidden;
+}
+
+.inst-row {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border: 2px solid var(--ink);
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.inst-cell { padding: 14px 16px; min-width: 0; }
+.inst-cell + .inst-cell { border-left: 2px solid var(--ink); }
+.inst-cell dt { color: var(--ash); margin-bottom: 6px; }
+.inst-cell dd {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ============================================================
+   04 — SETTINGS VIEW
+   ============================================================ */
+
+.settings-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+
+.settings-head h3 {
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: -.015em;
+  font-size: clamp(22px, 3vw, 30px);
+}
+
+.settings-note { color: var(--ash); }
+
+.settings-panel {
+  background: var(--paper);
+  border: 2px solid var(--ink);
+  box-shadow: var(--hard);
+  padding: clamp(16px, 2.5vw, 24px);
+  display: grid;
+  gap: 14px;
+}
+
+.cam-card {
+  border: 2px solid var(--ink);
+  background: var(--paper-2);
+  padding: 16px;
+  display: grid;
+  grid-template-columns: minmax(140px, 220px) 1fr auto;
+  gap: 14px;
+  align-items: start;
+}
+
+.cam-card.is-invalid { border-color: var(--bad); box-shadow: 3px 3px 0 0 var(--bad); }
+
+.field { display: grid; gap: 6px; min-width: 0; }
+
+.field label {
+  font-family: "JetBrains Mono", monospace;
+  font-size: .62rem;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: #4a4941;
+}
+
+.field input {
+  font-family: "JetBrains Mono", monospace;
+  font-size: .8rem;
+  color: var(--ink);
+  background: var(--paper);
+  border: 2px solid var(--ink);
+  padding: 10px 12px;
+  width: 100%;
+  border-radius: 0;
+}
+.field input::placeholder { color: var(--ash); }
+.field input:focus-visible { outline-offset: 0; }
+.field input[aria-invalid="true"] { border-color: var(--bad); }
+
+.field-hint { color: var(--ash); font-family: "JetBrains Mono", monospace; font-size: .6rem; letter-spacing: .06em; }
+
+.card-actions { display: flex; gap: 8px; align-self: stretch; align-items: stretch; }
+
+.error-line {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .66rem;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--bad);
+}
+.error-line::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  background: var(--bad);
+  flex: none;
+}
+
+.help-block {
+  border: 2px solid var(--ink);
+  background: var(--paper);
+}
+
+.help-block summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .7rem;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.help-block summary::-webkit-details-marker { display: none; }
+.help-block summary .tick {
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 1.1rem;
+  font-weight: 700;
+  line-height: 1;
+  transition: transform .15s ease;
+}
+.help-block[open] summary .tick { transform: rotate(45deg); }
+.help-block summary:hover { background: var(--paper-2); }
+
+.help-body { border-top: 2px solid var(--ink); padding: 16px; display: grid; gap: 14px; }
+.help-body p { font-style: italic; color: #33322b; max-width: 62ch; }
+
+.vendor-list { list-style: none; display: grid; gap: 8px; }
+.vendor-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .72rem;
+  letter-spacing: .04em;
+  border-top: 1px solid var(--concrete);
+  padding-top: 8px;
+}
+.vendor-tag {
+  font-weight: 700;
+  letter-spacing: .14em;
+  background: var(--ink);
+  color: var(--paper);
+  padding: 3px 8px;
+  flex: none;
+}
+.vendor-path { color: #33322b; overflow-wrap: anywhere; }
+
+.url-template {
+  font-family: "JetBrains Mono", monospace;
+  font-size: .74rem;
+  background: var(--mod);
+  border: 2px solid var(--ink);
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
+}
+
+.add-row { display: flex; }
+.add-row .btn { width: 100%; justify-content: center; background: var(--paper); }
+
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* ============================================================
+   FOOTER
+   ============================================================ */
+
+.site-foot {
+  background: var(--soot-2);
+  border-top: 3px solid var(--paper);
+}
+
+.foot-inner {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 26px 24px 34px;
+  display: grid;
+  gap: 16px;
+}
+
+.foot-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.foot-row .label { color: var(--concrete); }
+.foot-row .label.dim { color: var(--ash); }
+
+/* ============================================================
+   LEGEND (plate 01 annotation column)
+   ============================================================ */
+
+.legend-layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: clamp(20px, 3vw, 36px);
+  align-items: start;
+}
+
+.legend { display: grid; gap: 0; border-top: 2px solid var(--ink); }
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 4px;
+  border-bottom: 1px solid var(--concrete);
+}
+.swatch {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--ink);
+  flex: none;
+}
+.legend-row .label { color: var(--ink); }
+.legend-row .hex {
+  margin-left: auto;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .66rem;
+  color: var(--ash);
+}
+.legend-note { font-style: italic; color: #33322b; margin-top: 14px; max-width: 56ch; }
+
+.spec-list { list-style: none; margin-top: 18px; display: grid; gap: 8px; }
+.spec-list li {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .68rem;
+  letter-spacing: .08em;
+  color: #33322b;
+}
+.spec-list li::before { content: "//"; color: var(--bad); font-weight: 700; }
+
+/* ============================================================
+   ANIMATION
+   ============================================================ */
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .25; }
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .2; }
+}
+@keyframes sweep {
+  0%       { transform: translateY(-110%); }
+  100%     { transform: translateY(420%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+  html { scroll-behavior: auto; }
+}
+
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
+
+@media (max-width: 900px) {
+  .app-frame { grid-template-columns: 1fr; }
+  .side {
+    border-right: none;
+    border-bottom: 2px solid var(--concrete);
+  }
+  .side-nav { flex-direction: row; flex-wrap: wrap; }
+  .nav-item { flex: 1 1 auto; justify-content: center; }
+  .legend-layout { grid-template-columns: 1fr; }
+  .cam-card { grid-template-columns: 1fr; }
+  .card-actions { justify-content: flex-end; }
+  .btn-danger { width: 100%; justify-content: center; }
+  .inst-row { grid-template-columns: repeat(2, 1fr); }
+  .inst-cell:nth-child(3) { border-left: none; }
+  .inst-cell:nth-child(n+3) { border-top: 2px solid var(--ink); }
+}
+
+@media (max-width: 480px) {
+  main { padding: 32px 12px 48px; gap: 36px; }
+  .head-row { padding: 20px 16px 18px; }
+  .plate { box-shadow: 4px 4px 0 0 var(--ink); }
+  .tile-grid { grid-template-columns: 1fr; padding: 12px; gap: 12px; }
+  .toolbar, .solo-top { padding: 14px 12px; }
+  .solo-status { margin-left: 0; text-align: left; justify-items: start; }
+  .foot-inner { padding: 20px 16px 28px; }
+  .settings-actions .btn { flex: 1; justify-content: center; }
+}
+</style>
+</head>
+
+<body>
+
+<a class="skip-link" href="#plates">Skip to content</a>
+
+<!-- ================= HEADER ================= -->
+<header class="site-head">
+  <div class="head-row">
+    <h1><a class="wordmark" href="#top"><span class="wm-block" aria-hidden="true"></span>CAM-VIEWER</a></h1>
+    <p class="head-tag">A local RTSP console, drawn like a broadsheet.</p>
+    <div class="head-meta">
+      <nav class="head-nav" aria-label="Plates">
+        <a href="#s-sidebar">01 Sidebar</a>
+        <a href="#s-grid">02 Grid</a>
+        <a href="#s-solo">03 Solo</a>
+        <a href="#s-settings">04 Settings</a>
+      </nav>
+      <span class="label">Mockup v2 · 2026-08-25</span>
+    </div>
+  </div>
+</header>
+
+<main id="plates">
+
+  <!-- ================= 01 · SIDEBAR ================= -->
+  <section class="plate" id="s-sidebar" aria-labelledby="h-sidebar">
+    <div class="plate-head">
+      <p class="plate-index display">01<em>.</em></p>
+      <p class="plate-meta label">Plate 01/04 — Component<br>Persistent rail · 272px</p>
+    </div>
+    <h2 class="display" id="h-sidebar">Sidebar</h2>
+    <p class="annotation">
+      The persistent rail. Every screen keeps this column: wordmark, two destinations,
+      then the fleet listed as instrument readings. One square dot per camera — green while
+      frames flow, amber while ffmpeg renegotiates, red when the pipe is dead, ash when you
+      told it to sleep.
+    </p>
+
+    <div class="legend-layout">
+      <div class="board">
+        <!-- Embedded sidebar component -->
+        <aside class="app-frame" style="grid-template-columns: 1fr;" aria-label="Sidebar component preview">
+          <div class="side">
+            <p class="side-mark"><span class="wm-block" aria-hidden="true"></span>CAM-VIEWER</p>
+            <p class="side-sub label">6 signals · local only</p>
+            <nav class="side-nav" aria-label="Views">
+              <a class="nav-item is-active" href="#s-grid" aria-current="page">Grid View <span class="nav-count">6</span></a>
+              <a class="nav-item" href="#s-settings">Settings</a>
+            </nav>
+            <p class="cam-list-title label">Cameras</p>
+            <ul class="cam-list">
+              <li class="cam-row is-here">
+                <span class="dot d-online" aria-hidden="true"></span>
+                <span class="cam-name">Lateral</span>
+                <span class="cam-state s-online">online</span>
+              </li>
+              <li class="cam-row">
+                <span class="dot d-online" aria-hidden="true"></span>
+                <span class="cam-name">Cochera</span>
+                <span class="cam-state s-online">online</span>
+              </li>
+              <li class="cam-row">
+                <span class="dot d-connecting" aria-hidden="true"></span>
+                <span class="cam-name">Patio</span>
+                <span class="cam-state s-connecting">connecting</span>
+              </li>
+              <li class="cam-row">
+                <span class="dot d-online" aria-hidden="true"></span>
+                <span class="cam-name">Frente</span>
+                <span class="cam-state s-online">online</span>
+              </li>
+              <li class="cam-row">
+                <span class="dot d-paused" aria-hidden="true"></span>
+                <span class="cam-name">Azotea</span>
+                <span class="cam-state s-paused">paused</span>
+              </li>
+              <li class="cam-row">
+                <span class="dot d-offline" aria-hidden="true"></span>
+                <span class="cam-name">Garita</span>
+                <span class="cam-state s-offline">offline</span>
+              </li>
+            </ul>
+          </div>
+        </aside>
+      </div>
+
+      <div>
+        <h3 class="label" style="margin-bottom:10px;">Status mapping</h3>
+        <dl class="legend">
+          <div class="legend-row">
+            <dt class="label" style="display:flex;align-items:center;gap:12px;">
+              <span class="swatch" style="background:var(--good);" aria-hidden="true"></span>Online
+            </dt>
+            <dd class="hex">#00b050</dd>
+          </div>
+          <div class="legend-row">
+            <dt class="label" style="display:flex;align-items:center;gap:12px;">
+              <span class="swatch" style="background:var(--mod);" aria-hidden="true"></span>Connecting
+            </dt>
+            <dd class="hex">#ffd200</dd>
+          </div>
+          <div class="legend-row">
+            <dt class="label" style="display:flex;align-items:center;gap:12px;">
+              <span class="swatch" style="background:var(--bad);" aria-hidden="true"></span>Offline
+            </dt>
+            <dd class="hex">#e30613</dd>
+          </div>
+          <div class="legend-row">
+            <dt class="label" style="display:flex;align-items:center;gap:12px;">
+              <span class="swatch" style="background:var(--ash);" aria-hidden="true"></span>Paused
+            </dt>
+            <dd class="hex">#6b6a62</dd>
+          </div>
+        </dl>
+        <p class="legend-note">
+          The same four hues drive tile badges, solo-view status lines and list dots,
+          so severity reads at a glance.
+        </p>
+        <ul class="spec-list">
+          <li>Wordmark set in JetBrains Mono, +0.2em tracking</li>
+          <li>Active nav item inverts to paper with a red offset shadow</li>
+          <li>Status dots render as 10px squares with a hairline outline</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 02 · GRID VIEW ================= -->
+  <section class="plate" id="s-grid" aria-labelledby="h-grid">
+    <div class="plate-head">
+      <p class="plate-index display">02<em>.</em></p>
+      <p class="plate-meta label">Plate 02/04 — Screen<br>Auto-fit mosaic · 16:9 tiles</p>
+    </div>
+    <h2 class="display" id="h-grid">Grid View</h2>
+    <p class="annotation">
+      Six signals, auto-fitted. Tiles hold a strict 16:9 ratio at any width; the overlays behave
+      like OSD menus — name top-left, state chip top-right, clock bottom-right. Click through
+      and the mosaic gives way.
+    </p>
+
+    <div class="app-frame" id="grid-demo" aria-label="Grid view preview">
+      <aside class="side" aria-label="Persistent sidebar">
+        <p class="side-mark"><span class="wm-block" aria-hidden="true"></span>CAM-VIEWER</p>
+        <p class="side-sub label">6 signals · local only</p>
+        <nav class="side-nav" aria-label="Views">
+          <a class="nav-item is-active" href="#s-grid" aria-current="page">Grid View <span class="nav-count">6</span></a>
+          <a class="nav-item" href="#s-settings">Settings</a>
+        </nav>
+        <p class="cam-list-title label">Cameras</p>
+        <ul class="cam-list">
+          <li class="cam-row"><span class="dot d-online" aria-hidden="true"></span><span class="cam-name">Lateral</span><span class="cam-state s-online">online</span></li>
+          <li class="cam-row"><span class="dot d-online" aria-hidden="true"></span><span class="cam-name">Cochera</span><span class="cam-state s-online">online</span></li>
+          <li class="cam-row"><span class="dot d-connecting" aria-hidden="true"></span><span class="cam-name">Patio</span><span class="cam-state s-connecting">connecting</span></li>
+          <li class="cam-row"><span class="dot d-online" aria-hidden="true"></span><span class="cam-name">Frente</span><span class="cam-state s-online">online</span></li>
+          <li class="cam-row"><span class="dot d-paused" aria-hidden="true"></span><span class="cam-name">Azotea</span><span class="cam-state s-paused">paused</span></li>
+          <li class="cam-row"><span class="dot d-offline" aria-hidden="true"></span><span class="cam-name">Garita</span><span class="cam-state s-offline">offline</span></li>
+        </ul>
+      </aside>
+
+      <div>
+        <div class="toolbar">
+          <p class="toolbar-title">Grid View<span class="toolbar-count label">4 online / 6</span></p>
+          <div class="toolbar-actions">
+            <a class="btn" href="#s-settings">+ Add camera</a>
+            <button class="btn" type="button">Pause all</button>
+          </div>
+        </div>
+
+        <div class="tile-grid">
+          <!-- Lateral -->
+          <div class="tile" role="img" aria-label="Lateral — online">
+            <div class="video-area"></div>
+            <span class="reticle" aria-hidden="true"></span>
+            <div class="tile-top">
+              <span class="tile-id">
+                <span class="tile-cam-noise">CAM 01 · 1920×1080</span>
+                <span class="tile-name">Lateral</span>
+              </span>
+              <span class="badge b-online">Online</span>
+            </div>
+            <span class="tile-bottom"><span class="live-dot" aria-hidden="true"></span>Live · 25 fps</span>
+            <span class="tile-ts">14:32:07</span>
+          </div>
+
+          <!-- Cochera -->
+          <div class="tile" role="img" aria-label="Cochera — online">
+            <div class="video-area"></div>
+            <span class="reticle" aria-hidden="true"></span>
+            <div class="tile-top">
+              <span class="tile-id">
+                <span class="tile-cam-noise">CAM 02 · 1920×1080</span>
+                <span class="tile-name">Cochera</span>
+              </span>
+              <span class="badge b-online">Online</span>
+            </div>
+            <span class="tile-bottom"><span class="live-dot" aria-hidden="true"></span>Live · 25 fps</span>
+            <span class="tile-ts">14:32:07</span>
+          </div>
+
+          <!-- Patio -->
+          <div class="tile" role="img" aria-label="Patio — connecting">
+            <div class="video-area"></div>
+            <span class="sweep" aria-hidden="true"></span>
+            <div class="tile-top">
+              <span class="tile-id">
+                <span class="tile-cam-noise">CAM 03 · PROBE</span>
+                <span class="tile-name">Patio</span>
+              </span>
+              <span class="badge b-connecting">Connecting</span>
+            </div>
+            <span class="tile-ghost" aria-hidden="true">Reconnecting</span>
+            <span class="tile-bottom"><span class="live-dot ld-connecting" aria-hidden="true"></span>Rety 03</span>
+            <span class="tile-ts">14:32:07</span>
+          </div>
+
+          <!-- Frente -->
+          <div class="tile" role="img" aria-label="Frente — online">
+            <div class="video-area"></div>
+            <span class="reticle" aria-hidden="true"></span>
+            <div class="tile-top">
+              <span class="tile-id">
+                <span class="tile-cam-noise">CAM 04 · 1920×1080</span>
+                <span class="tile-name">Frente</span>
+              </span>
+              <span class="badge b-online">Online</span>
+            </div>
+            <span class="tile-bottom"><span class="live-dot" aria-hidden="true"></span>Live · 25 fps</span>
+            <span class="tile-ts">14:32:07</span>
+          </div>
+
+          <!-- Azotea -->
+          <div class="tile" role="img" aria-label="Azotea — paused">
+            <div class="video-area" style="opacity:.55;"></div>
+            <div class="tile-top">
+              <span class="tile-id">
+                <span class="tile-cam-noise">CAM 05 · FROZEN</span>
+                <span class="tile-name">Azotea</span>
+              </span>
+              <span class="badge b-paused">Paused</span>
+            </div>
+            <span class="tile-ghost" aria-hidden="true">Paused</span>
+            <span class="tile-bottom"><span class="live-dot ld-paused" aria-hidden="true"></span>Held by focus loss</span>
+            <span class="tile-ts">14:31:52</span>
+          </div>
+
+          <!-- Garita -->
+          <div class="tile" role="img" aria-label="Garita — offline">
+            <div class="video-area v-offline"></div>
+            <div class="tile-top">
+              <span class="tile-id">
+                <span class="tile-cam-noise">CAM 06 · NO FEED</span>
+                <span class="tile-name">Garita</span>
+              </span>
+              <span class="badge b-offline">Offline</span>
+            </div>
+            <span class="tile-ghost" aria-hidden="true">No Signal</span>
+            <span class="tile-ts">14:12:40</span>
+          </div>
+        </div>
+
+        <div class="grid-foot">
+          <span class="label">ffmpeg pipeline · one process per camera</span>
+          <span class="label">Click a tile to open solo view ↓</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 03 · SOLO VIEW ================= -->
+  <section class="plate" id="s-solo" aria-labelledby="h-solo">
+    <div class="plate-head">
+      <p class="plate-index display">03<em>.</em></p>
+      <p class="plate-meta label">Plate 03/04 — Screen<br>Single feed · instrument deck</p>
+    </div>
+    <h2 class="display" id="h-solo">Solo View</h2>
+    <p class="annotation">
+      One camera, full bleed. The chrome recedes until a single instrument deck remains:
+      resolution, codec, framerate, bitrate. BACK returns to the mosaic — nothing else
+      survives the trip.
+    </p>
+
+    <div class="app-frame solo-frame" id="solo-demo" aria-label="Solo view preview">
+      <div>
+        <div class="solo-top">
+          <a class="btn solo-back" href="#s-grid">&lt; Back</a>
+          <div class="solo-id">
+            <p class="solo-name">Lateral</p>
+            <p class="solo-path">rtsp://192.168.100.5:554/live/ch0</p>
+          </div>
+          <div class="solo-status">
+            <p class="st-line st-online"><span class="live-dot" aria-hidden="true"></span>Online</p>
+            <span class="label" style="color:var(--ash);">Uptime 06:41:12</span>
+          </div>
+        </div>
+
+        <div class="solo-stage">
+          <div class="solo-video" role="img" aria-label="Live feed from Lateral">
+            <div class="video-area"></div>
+            <span class="reticle" aria-hidden="true"></span>
+            <div class="tile-top">
+              <span class="tile-id">
+                <span class="tile-cam-noise">CAM 01 · SOLO</span>
+                <span class="tile-name">Lateral</span>
+              </span>
+              <span class="badge b-online">Online</span>
+            </div>
+            <span class="tile-bottom"><span class="live-dot" aria-hidden="true"></span>Rec-style live indicator</span>
+            <span class="tile-ts">2026-08-25 14:32:07</span>
+          </div>
+
+          <dl class="inst-row">
+            <div class="inst-cell">
+              <dt class="label">Resolution</dt>
+              <dd>1920×1080</dd>
+            </div>
+            <div class="inst-cell">
+              <dt class="label">Codec</dt>
+              <dd>H.264</dd>
+            </div>
+            <div class="inst-cell">
+              <dt class="label">FPS</dt>
+              <dd>25</dd>
+            </div>
+            <div class="inst-cell">
+              <dt class="label">Bitrate</dt>
+              <dd>4096 kbps</dd>
+            </div>
+          </dl>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 04 · SETTINGS VIEW ================= -->
+  <section class="plate" id="s-settings" aria-labelledby="h-settings">
+    <div class="plate-head">
+      <p class="plate-index display">04<em>.</em></p>
+      <p class="plate-meta label">Plate 04/04 — Screen<br>Paper editor · loud validation</p>
+    </div>
+    <h2 class="display" id="h-settings">Settings View</h2>
+    <p class="annotation">
+      The editor runs on paper. Every camera is two fields and an exit; validation fails loud
+      in signal red. URLs follow the rtsp://user:pass@ip:554/&lt;path&gt; shape, and the
+      cheat-sheet below covers the usual vendors.
+    </p>
+
+    <div class="settings-head">
+      <h3>Settings</h3>
+      <span class="label settings-note">cameras.toml · edited in app · 7 entries</span>
+    </div>
+
+    <form class="settings-panel" action="#" method="post">
+
+      <div class="cam-card">
+        <div class="field">
+          <label for="cam-name-1">Name</label>
+          <input type="text" id="cam-name-1" name="cam-name-1" value="Lateral">
+        </div>
+        <div class="field">
+          <label for="cam-url-1">RTSP URL</label>
+          <input type="text" id="cam-url-1" name="cam-url-1" value="rtsp://192.168.100.5:554/live/ch0" spellcheck="false">
+          <span class="field-hint">rtsp://user:pass@ip:554/path</span>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-danger btn-ghost" type="button">Delete</button>
+        </div>
+      </div>
+
+      <div class="cam-card">
+        <div class="field">
+          <label for="cam-name-2">Name</label>
+          <input type="text" id="cam-name-2" name="cam-name-2" value="Cochera">
+        </div>
+        <div class="field">
+          <label for="cam-url-2">RTSP URL</label>
+          <input type="text" id="cam-url-2" name="cam-url-2" value="rtsp://192.168.100.6:554/live/ch0" spellcheck="false">
+          <span class="field-hint">rtsp://user:pass@ip:554/path</span>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-danger btn-ghost" type="button">Delete</button>
+        </div>
+      </div>
+
+      <div class="cam-card">
+        <div class="field">
+          <label for="cam-name-3">Name</label>
+          <input type="text" id="cam-name-3" name="cam-name-3" value="Patio">
+        </div>
+        <div class="field">
+          <label for="cam-url-3">RTSP URL</label>
+          <input type="text" id="cam-url-3" name="cam-url-3" value="rtsp://admin:s3cret@192.168.100.7:554/stream1" spellcheck="false">
+          <span class="field-hint">rtsp://user:pass@ip:554/path</span>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-danger btn-ghost" type="button">Delete</button>
+        </div>
+      </div>
+
+      <div class="cam-card">
+        <div class="field">
+          <label for="cam-name-4">Name</label>
+          <input type="text" id="cam-name-4" name="cam-name-4" value="Frente">
+        </div>
+        <div class="field">
+          <label for="cam-url-4">RTSP URL</label>
+          <input type="text" id="cam-url-4" name="cam-url-4" value="rtsp://admin:s3cret@192.168.100.8:554/onvif1" spellcheck="false">
+          <span class="field-hint">rtsp://user:pass@ip:554/path</span>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-danger btn-ghost" type="button">Delete</button>
+        </div>
+      </div>
+
+      <div class="cam-card">
+        <div class="field">
+          <label for="cam-name-5">Name</label>
+          <input type="text" id="cam-name-5" name="cam-name-5" value="Azotea">
+        </div>
+        <div class="field">
+          <label for="cam-url-5">RTSP URL</label>
+          <input type="text" id="cam-url-5" name="cam-url-5" value="rtsp://viewer:hik123@192.168.100.9:554/Streaming/Channels/101" spellcheck="false">
+          <span class="field-hint">rtsp://user:pass@ip:554/path</span>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-danger btn-ghost" type="button">Delete</button>
+        </div>
+      </div>
+
+      <div class="cam-card">
+        <div class="field">
+          <label for="cam-name-6">Name</label>
+          <input type="text" id="cam-name-6" name="cam-name-6" value="Garita">
+        </div>
+        <div class="field">
+          <label for="cam-url-6">RTSP URL</label>
+          <input type="text" id="cam-url-6" name="cam-url-6" value="rtsp://192.168.100.10:554/live/ch0" spellcheck="false">
+          <span class="field-hint">rtsp://user:pass@ip:554/path</span>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-danger btn-ghost" type="button">Delete</button>
+        </div>
+      </div>
+
+      <!-- Invalid row: empty URL -->
+      <div class="cam-card is-invalid">
+        <div class="field">
+          <label for="cam-name-7">Name</label>
+          <input type="text" id="cam-name-7" name="cam-name-7" value="Perimetro">
+        </div>
+        <div class="field">
+          <label for="cam-url-7">RTSP URL</label>
+          <input type="text" id="cam-url-7" name="cam-url-7" value="" placeholder="rtsp://user:pass@ip:554/path" aria-invalid="true" aria-describedby="url-error-7" spellcheck="false">
+          <span class="field-hint">rtsp://user:pass@ip:554/path</span>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-danger btn-ghost" type="button">Delete</button>
+        </div>
+        <p class="error-line" id="url-error-7">URL required — the RTSP address cannot be empty</p>
+      </div>
+
+      <details class="help-block">
+        <summary>
+          How do I find the camera URL?
+          <span class="tick" aria-hidden="true">+</span>
+        </summary>
+        <div class="help-body">
+          <p>
+            Most cameras expose RTSP on port 554. The stream path depends on the vendor —
+            try these against your device, substituting user, password and IP:
+          </p>
+          <ul class="vendor-list">
+            <li><span class="vendor-tag">Dahua</span><span class="vendor-path">rtsp://user:pass@ip:554/live/ch0</span></li>
+            <li><span class="vendor-tag">Hikvision</span><span class="vendor-path">rtsp://user:pass@ip:554/Streaming/Channels/101</span></li>
+            <li><span class="vendor-tag">TP-Link</span><span class="vendor-path">rtsp://user:pass@ip:554/stream1</span></li>
+            <li><span class="vendor-tag">ONVIF</span><span class="vendor-path">rtsp://user:pass@ip:554/onvif1</span></li>
+          </ul>
+          <p class="url-template">Generic template → rtsp://user:pass@ip:554/&lt;vendor-path&gt;</p>
+        </div>
+      </details>
+
+      <div class="add-row">
+        <button class="btn" type="button">+ Add camera</button>
+      </div>
+
+      <div class="settings-actions">
+        <button class="btn" type="button">Cancel</button>
+        <button class="btn btn-primary" type="submit">Save</button>
+      </div>
+
+    </form>
+  </section>
+
+</main>
+
+<!-- ================= FOOTER ================= -->
+<footer class="site-foot">
+  <div class="foot-inner">
+    <div class="foot-row">
+      <span class="label">Local streams only · no cloud · ffmpeg pipeline</span>
+      <span class="label dim">Static mockup · zero JS · Space Grotesk / Newsreader / JetBrains Mono</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
