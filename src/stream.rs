@@ -9,6 +9,7 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const PAUSED_PROBE_INTERVAL: Duration = Duration::from_secs(8);
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const STREAM_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+const PAUSED_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -247,7 +248,7 @@ fn run_loop(shared: Shared, url: &str) {
                 stop_child(&shared.child);
                 *lock(&shared.status) = Status::Paused;
             }
-            let _ = probe_rtsp(url, STREAM_PROBE_TIMEOUT);
+            let _ = probe_rtsp(url, PAUSED_PROBE_TIMEOUT);
             sleep_interruptible(&shared.shutdown, &shared.paused, PAUSED_PROBE_INTERVAL);
             continue;
         }

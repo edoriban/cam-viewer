@@ -175,6 +175,9 @@ pub enum BtnVariant {
     Ink,
     /// Ghost danger: paper background, signal-red text; hover fills red.
     Danger,
+    /// Confirm action (save/add): paper background, ink text; hover fills
+    /// signal-green with paper text.
+    Confirm,
 }
 
 fn btn_palette(
@@ -203,6 +206,13 @@ fn btn_palette(
                 (PAPER, STATUS_OFFLINE, STATUS_OFFLINE)
             }
         }
+        BtnVariant::Confirm => {
+            if hovered {
+                (STATUS_ONLINE, PAPER, STATUS_ONLINE)
+            } else {
+                (PAPER, INK, INK)
+            }
+        }
     }
 }
 
@@ -227,11 +237,13 @@ fn draw_brutal_button(
     let hovered = response.hovered() || response.is_pointer_button_down_on();
     let (bg, fg, border) = btn_palette(variant, hovered);
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
-    let painter = ui.painter_at(rect);
     if variant != BtnVariant::Danger {
-        // Hard offset shadow, no blur.
-        painter.rect_filled(rect.translate(egui::vec2(4.0, 4.0)), 0.0, INK);
+        // Hard offset shadow, no blur. Drawn unclipped: painter_at(rect)
+        // below would cut off anything outside `rect`, including this offset.
+        ui.painter()
+            .rect_filled(rect.translate(egui::vec2(4.0, 4.0)), 0.0, CONCRETE);
     }
+    let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, bg);
     painter.rect_stroke(
         rect,
@@ -270,10 +282,12 @@ pub fn nav_item(ui: &mut egui::Ui, label: &str, count: Option<String>, active: b
     };
 
     let font = mono_font(10.5);
-    let painter = ui.painter_at(rect);
     if active {
-        painter.rect_filled(rect.translate(egui::vec2(3.0, 3.0)), 0.0, STATUS_OFFLINE);
+        // Drawn unclipped: painter_at(rect) below would cut off this offset.
+        ui.painter()
+            .rect_filled(rect.translate(egui::vec2(3.0, 3.0)), 0.0, STATUS_OFFLINE);
     }
+    let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, bg);
     painter.rect_stroke(
         rect,

@@ -10,11 +10,11 @@ use crate::theme::{self, BtnVariant};
 use eframe::egui;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 const REPAINT_INTERVAL: Duration = Duration::from_millis(50);
-const PAUSED_REPAINT_INTERVAL: Duration = Duration::from_millis(1000);
-const PAUSE_AFTER_UNFOCUSED: Duration = Duration::from_secs(10);
 const SIDEBAR_WIDTH: f32 = 236.0;
 const GRID_MIN_TILE_WIDTH: f32 = 360.0;
 const GRID_SPACING: f32 = 12.0;
@@ -42,6 +42,11 @@ pub struct SettingsEditor {
     rows: Vec<SettingsRow>,
     badge_position: BadgePosition,
     error: Option<String>,
+    original: Config,
+    /// First CANCEL/Escape while dirty arms this instead of discarding
+    /// immediately; a second one confirms. Prevents a reflex Escape from
+    /// silently losing an edit.
+    confirm_discard: bool,
 }
 
 impl SettingsEditor {
@@ -57,7 +62,15 @@ impl SettingsEditor {
                 .collect(),
             badge_position: config.badge_position,
             error: None,
+            original: config.clone(),
+            confirm_discard: false,
         }
+    }
+
+    /// SAVE is disabled while `collect()` + `badge_position` still matches
+    /// what the editor was opened with, so a no-op save can't restart streams.
+    fn is_dirty(&self) -> bool {
+        self.badge_position != self.original.badge_position || self.collect() != self.original.cameras
     }
 
     fn add_row(&mut self) {
@@ -163,13 +176,39 @@ fn global_creds(username: &str, password: &str) -> Option<(String, String)> {
     (!username.is_empty()).then(|| (username.to_owned(), password.trim().to_owned()))
 }
 
-/// Existing list plus extras, dropping any extra whose URL string exactly
-/// matches an existing camera or an earlier extra (belt-and-braces dedup,
+/// (host, port, path) for an rtsp/http URL, with a missing port defaulting
+/// to RTSP's 554 so `host/path` and `host:554/path` compare as the same
+/// camera (a manually-configured URL usually omits the default port while
+/// discovery always states it explicitly).
+fn url_identity(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.split_once("://")?.1;
+    let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (host, port) = if host_port.starts_with('[') {
+        (host_port.to_owned(), None)
+    } else {
+        match host_port.split_once(':') {
+            Some((h, p)) => (h.to_owned(), p.parse().ok()),
+            None => (host_port.to_owned(), None),
+        }
+    };
+    (!host.is_empty()).then(|| (host, port.unwrap_or(554), path.to_owned()))
+}
+
+/// Same camera per `url_identity`, not necessarily the same URL string.
+fn same_camera_url(a: &str, b: &str) -> bool {
+    url_identity(a).is_some_and(|ia| url_identity(b) == Some(ia))
+}
+
+/// Existing list plus extras, dropping any extra that identifies the same
+/// camera as an existing one or an earlier extra (belt-and-braces dedup,
 /// same equality `apply_cameras` uses for stream reuse).
 fn merge_cameras(existing: &[CameraConfig], extra: Vec<CameraConfig>) -> Vec<CameraConfig> {
     let mut merged = existing.to_vec();
     for cam in extra {
-        if !merged.iter().any(|m| m.url == cam.url) {
+        if !merged.iter().any(|m| same_camera_url(&m.url, &cam.url)) {
             merged.push(cam);
         }
     }
@@ -219,7 +258,7 @@ fn reconcile_rows(
                 let exact_duplicate = result
                     .url
                     .as_deref()
-                    .is_some_and(|url| existing.iter().any(|cam| cam.url == url));
+                    .is_some_and(|url| existing.iter().any(|cam| same_camera_url(&cam.url, url)));
                 let ip = result.ip.to_string();
                 let duplicate = exact_duplicate
                     || existing
@@ -373,7 +412,7 @@ impl DiscoverWizard {
                 ui.label(
                     egui::RichText::new("DISCOVER")
                         .font(theme::display_font(30.0))
-                        .color(theme::INK),
+                        .color(theme::PAPER),
                 );
                 ui.label(theme::micro_label(
                     format!(
@@ -415,6 +454,11 @@ impl DiscoverWizard {
         }
 
         ui.label(theme::micro_label("SUBNET", theme::LABEL_ON_PAPER));
+        // Re-applied locally: ComboBox builds its own child Ui for the
+        // closed button and it doesn't reliably inherit the ambient
+        // paper_visuals() call at the top of show(), leaving it on the
+        // dark widget palette (looked disabled against the SOOT page).
+        paper_visuals(ui);
         egui::ComboBox::from_id_salt("discover_subnet")
             .selected_text(self.subnet_label(self.selected_iface))
             .width(280.0)
@@ -459,7 +503,7 @@ impl DiscoverWizard {
             ui,
             egui::vec2(ui.available_width(), 34.0),
             "SCAN",
-            BtnVariant::Ink,
+            BtnVariant::Confirm,
         ) {
             *action = DiscoverAction::Scan;
         }
@@ -484,15 +528,18 @@ impl DiscoverWizard {
                 theme::LABEL_ON_PAPER,
             )),
         };
+        auth_legend(ui);
         self.maybe_ws_hint(ui);
         ui.add_space(6.0);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .max_height(ui.available_height() - 50.0)
             .show(ui, |ui| {
                 discover_rows_ui(ui, &mut self.rows);
             });
 
+        ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if self.cancelling {
                 ui.label(theme::micro_label(
@@ -520,11 +567,13 @@ impl DiscoverWizard {
             ),
             theme::LABEL_ON_PAPER,
         ));
+        auth_legend(ui);
         self.maybe_ws_hint(ui);
         ui.add_space(6.0);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .max_height(ui.available_height() - 50.0)
             .show(ui, |ui| {
                 discover_rows_ui(ui, &mut self.rows);
             });
@@ -533,17 +582,17 @@ impl DiscoverWizard {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Disabled (unclickable) when nothing addable is ticked (REQ-13).
             let can_add = selected > 0;
-            let variant = if can_add {
-                BtnVariant::Ink
-            } else {
-                BtnVariant::Paper
-            };
             let clicked = ui
                 .scope(|ui| {
                     if !can_add {
                         ui.disable();
                     }
-                    theme::brutal_button_sized(ui, egui::vec2(170.0, 34.0), "ADD SELECTED", variant)
+                    theme::brutal_button_sized(
+                        ui,
+                        egui::vec2(170.0, 34.0),
+                        "ADD SELECTED",
+                        BtnVariant::Confirm,
+                    )
                 })
                 .inner;
             if clicked {
@@ -597,67 +646,71 @@ fn discover_rows_ui(ui: &mut egui::Ui, rows: &mut [DiscoverRow]) {
 }
 
 fn discover_row_card(ui: &mut egui::Ui, row: &mut DiscoverRow) {
+    let border = if row.checked {
+        theme::STATUS_OFFLINE
+    } else {
+        theme::INK
+    };
     egui::Frame::new()
         .fill(theme::PAPER_2)
-        .stroke(egui::Stroke::new(2.0_f32, theme::INK))
+        .stroke(egui::Stroke::new(2.0_f32, border))
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // REQ-10 binding semantics: warning-dot hosts are NOT addable.
-                ui.add_enabled(
-                    row.addable(),
-                    egui::Checkbox::without_text(&mut row.checked),
-                );
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                ui.painter()
-                    .rect_filled(dot, 0.0, auth_color(row.result.auth));
-                ui.painter().rect_stroke(
-                    dot,
-                    0.0,
-                    egui::Stroke::new(1.0_f32, theme::PAPER.gamma_multiply(0.25)),
-                    egui::StrokeKind::Inside,
-                );
+            paper_visuals(ui);
+            // REQ-10 binding semantics: warning-dot / already-configured hosts
+            // are not addable; fade the whole row so that reads as disabled,
+            // not just the checkbox.
+            ui.add_enabled_ui(row.addable(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut row.checked, "");
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(dot, 0.0, auth_color(row.result.auth));
+                    ui.painter().rect_stroke(
+                        dot,
+                        0.0,
+                        egui::Stroke::new(1.0_f32, theme::PAPER.gamma_multiply(0.25)),
+                        egui::StrokeKind::Inside,
+                    );
 
-                ui.vertical(|ui| {
-                    let headline = match &row.result.vendor {
-                        Some(vendor) => {
-                            format!("{} \u{b7} {}", row.result.ip, vendor.to_uppercase())
-                        }
-                        None => row.result.ip.to_string(),
-                    };
-                    ui.label(
-                        egui::RichText::new(headline)
-                            .font(theme::mono_font(12.5))
-                            .color(theme::INK),
-                    );
-                    let detail = match (&row.result.url, row.result.resolution) {
-                        (Some(url), Some((w, h))) => format!("{url}  \u{b7}  {w}\u{d7}{h}"),
-                        (Some(url), None) => url.clone(),
-                        (None, _) => {
-                            String::from("NO WORKING URL \u{2014} AUTHENTICATION REQUIRED")
-                        }
-                    };
-                    let shown = theme::elide_to_width(
-                        ui.painter(),
-                        &detail,
-                        theme::mono_font(10.0),
-                        ui.available_width(),
-                        theme::LABEL_ON_PAPER,
-                    );
-                    ui.label(theme::micro_label(shown, theme::LABEL_ON_PAPER));
-                    if row.exact_duplicate {
-                        ui.label(theme::micro_label(
-                            "ALREADY CONFIGURED",
+                    ui.vertical(|ui| {
+                        let headline = match &row.result.vendor {
+                            Some(vendor) => {
+                                format!("{} \u{b7} {}", row.result.ip, vendor.to_uppercase())
+                            }
+                            None => row.result.ip.to_string(),
+                        };
+                        ui.label(
+                            egui::RichText::new(headline)
+                                .font(theme::mono_font(12.5))
+                                .color(theme::INK),
+                        );
+                        let detail = match (&row.result.url, row.result.resolution) {
+                            (Some(url), Some((w, h))) => format!("{url}  \u{b7}  {w}\u{d7}{h}"),
+                            (Some(url), None) => url.clone(),
+                            (None, _) => {
+                                String::from("NO WORKING URL \u{2014} AUTHENTICATION REQUIRED")
+                            }
+                        };
+                        let shown = theme::elide_to_width(
+                            ui.painter(),
+                            &detail,
+                            theme::mono_font(10.0),
+                            ui.available_width(),
                             theme::LABEL_ON_PAPER,
-                        ));
-                    } else if row.duplicate {
-                        ui.label(theme::micro_label(
-                            "SAME HOST ALREADY CONFIGURED",
-                            theme::LABEL_ON_PAPER,
-                        ));
-                    }
+                        );
+                        ui.label(theme::micro_label(shown, theme::LABEL_ON_PAPER));
+                    });
                 });
             });
+            // Drawn at full contrast, outside the fade above: this is the
+            // reason the row is disabled, so it must stay legible.
+            if row.exact_duplicate {
+                ui.label(theme::micro_label("ALREADY CONFIGURED", theme::INK));
+            } else if row.duplicate {
+                ui.label(theme::micro_label("SAME HOST ALREADY CONFIGURED", theme::INK));
+            }
         });
 }
 
@@ -667,6 +720,21 @@ fn auth_color(auth: AuthStatus) -> egui::Color32 {
         AuthStatus::Authenticated | AuthStatus::Open => theme::STATUS_ONLINE,
         AuthStatus::NeedsCredentials => theme::STATUS_CONNECTING,
     }
+}
+
+/// Explains the row dot colors: nothing else on screen says what they mean.
+fn auth_legend(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        for (color, label) in [
+            (theme::STATUS_ONLINE, "OPEN / AUTHENTICATED \u{2014} ADDABLE"),
+            (theme::STATUS_CONNECTING, "NEEDS CREDENTIALS"),
+        ] {
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+            ui.painter().rect_filled(dot, 0.0, color);
+            ui.label(theme::micro_label(label, theme::LABEL_ON_PAPER));
+            ui.add_space(10.0);
+        }
+    });
 }
 
 /// Inline error banner shared by Settings and Discover (dot + red mono text).
@@ -701,57 +769,9 @@ enum DiscoverAction {
     AddSelected,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FocusChange {
-    None,
-    EnteredPause,
-    ExitedPause,
-}
-
-#[derive(Debug)]
-struct FocusTracker {
-    unfocused_since: Option<Instant>,
-    paused: bool,
-}
-
-impl FocusTracker {
-    fn new() -> Self {
-        Self {
-            unfocused_since: None,
-            paused: false,
-        }
-    }
-
-    fn observe(&mut self, active: bool, now: Instant) -> FocusChange {
-        if active {
-            self.unfocused_since = None;
-            return if self.paused {
-                self.paused = false;
-                FocusChange::ExitedPause
-            } else {
-                FocusChange::None
-            };
-        }
-        match self.unfocused_since {
-            None => self.unfocused_since = Some(now),
-            Some(since) if !self.paused && now.duration_since(since) >= PAUSE_AFTER_UNFOCUSED => {
-                self.paused = true;
-                return FocusChange::EnteredPause;
-            }
-            Some(_) => {}
-        }
-        FocusChange::None
-    }
-
-    fn paused(&self) -> bool {
-        self.paused
-    }
-}
-
 pub struct CamViewerApp {
     cameras: Vec<CameraView>,
     view: View,
-    focus: FocusTracker,
     settings: SettingsEditor,
     discover: Option<DiscoverWizard>,
     badge_position: BadgePosition,
@@ -776,19 +796,9 @@ impl CamViewerApp {
             } else {
                 View::Grid
             },
-            focus: FocusTracker::new(),
             settings: SettingsEditor::from_config(config),
             discover: None,
             badge_position: config.badge_position,
-        }
-    }
-
-    fn set_paused(&mut self, paused: bool) {
-        for cam in &mut self.cameras {
-            cam.stream.set_paused(paused);
-            if paused {
-                cam.texture = None;
-            }
         }
     }
 
@@ -930,7 +940,6 @@ impl CamViewerApp {
 
         drop(pool.into_iter().flatten());
         self.cameras = cameras;
-        self.set_paused(self.focus.paused());
     }
 }
 
@@ -945,24 +954,19 @@ impl eframe::App for CamViewerApp {
             }
         }
 
-        let active = ctx.input(|i| {
-            let viewport = i.viewport();
-            viewport.focused.unwrap_or(true) && !viewport.minimized.unwrap_or(false)
-        });
-        match self.focus.observe(active, Instant::now()) {
-            FocusChange::EnteredPause => self.set_paused(true),
-            FocusChange::ExitedPause => self.set_paused(false),
-            FocusChange::None => {}
-        }
-
-        let paused = self.focus.paused();
-
         if matches!(self.view, View::Settings) && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.cancel_settings();
+            if self.settings.is_dirty() && !self.settings.confirm_discard {
+                self.settings.confirm_discard = true;
+            } else {
+                self.cancel_settings();
+            }
         }
         // Escape leaves Discover; dropping the wizard cancels any scan.
         if matches!(self.view, View::Discover) && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.close_discover();
+        }
+        if matches!(self.view, View::Solo(_)) && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.view = View::Grid;
         }
 
         let sidebar = show_sidebar(ctx, &self.view, &self.cameras);
@@ -981,15 +985,15 @@ impl eframe::App for CamViewerApp {
         }
 
         match self.view {
-            View::Grid => {
-                if let Some(index) = show_grid(ctx, &mut self.cameras, paused, self.badge_position)
-                {
-                    self.view = View::Solo(index);
-                }
-            }
+            View::Grid => match show_grid(ctx, &mut self.cameras, self.badge_position) {
+                GridAction::OpenSolo(index) => self.view = View::Solo(index),
+                GridAction::GoToDiscover => self.open_discover(),
+                GridAction::GoToSettings => self.open_settings(),
+                GridAction::None => {}
+            },
             View::Solo(index) => {
                 if index >= self.cameras.len()
-                    || show_solo(ctx, &mut self.cameras[index], paused, self.badge_position)
+                    || show_solo(ctx, &mut self.cameras[index], self.badge_position)
                 {
                     self.view = View::Grid;
                 }
@@ -1027,11 +1031,7 @@ impl eframe::App for CamViewerApp {
             },
         }
 
-        ctx.request_repaint_after(if paused {
-            PAUSED_REPAINT_INTERVAL
-        } else {
-            REPAINT_INTERVAL
-        });
+        ctx.request_repaint_after(REPAINT_INTERVAL);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1145,17 +1145,14 @@ fn camera_row(ui: &mut egui::Ui, cam: &CameraView, status: Status, selected: boo
     let width = ui.available_width();
     let height = if selected { 46.0 } else { 30.0 };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
-    let painter = ui.painter_at(rect);
 
+    if selected {
+        ui.painter()
+            .rect_filled(rect.translate(egui::vec2(4.0, 4.0)), 0.0, theme::CONCRETE);
+    }
+    let painter = ui.painter_at(rect);
     if selected || response.hovered() {
         painter.rect_filled(rect, 0.0, theme::SOOT_2);
-    }
-    if selected {
-        painter.rect_filled(
-            egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, height)),
-            0.0,
-            theme::PAPER,
-        );
     }
 
     let dot_y = if selected {
@@ -1216,13 +1213,21 @@ fn camera_row(ui: &mut egui::Ui, cam: &CameraView, status: Status, selected: boo
 // Grid view
 // ---------------------------------------------------------------------------
 
+/// Grid-view outcome: open a tile solo, or jump elsewhere from the empty state.
+enum GridAction {
+    None,
+    OpenSolo(usize),
+    GoToDiscover,
+    GoToSettings,
+}
+
 fn show_grid(
     ctx: &egui::Context,
     cameras: &mut [CameraView],
-    paused: bool,
     badge_position: BadgePosition,
-) -> Option<usize> {
+) -> GridAction {
     let mut opened = None;
+    let mut empty_state_action = GridAction::None;
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
@@ -1237,6 +1242,15 @@ fn show_grid(
                         .font(theme::mono_font(12.0))
                         .color(theme::ASH),
                 );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if theme::brutal_button(ui, "DISCOVER", BtnVariant::Confirm) {
+                        empty_state_action = GridAction::GoToDiscover;
+                    }
+                    if theme::brutal_button(ui, "+ ADD CAMERA", BtnVariant::Paper) {
+                        empty_state_action = GridAction::GoToSettings;
+                    }
+                });
                 return;
             }
             let cols = pick_columns(avail, cameras.len());
@@ -1257,33 +1271,33 @@ fn show_grid(
                 tile_h,
             };
             if needed_h <= avail.y {
-                draw_grid_rows(ui, cameras, layout, paused, badge_position, &mut opened);
+                draw_grid_rows(ui, cameras, layout, badge_position, &mut opened);
             } else {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        draw_grid_rows(ui, cameras, layout, paused, badge_position, &mut opened);
+                        draw_grid_rows(ui, cameras, layout, badge_position, &mut opened);
                     });
             }
         });
-    opened
+    match opened {
+        Some(index) => GridAction::OpenSolo(index),
+        None => empty_state_action,
+    }
 }
 
-/// Columns chosen from width (~360px minimum tiles), capped so rows fit the height.
+/// Near-square column count: 1x1, 1x2, 2x2, 2x3, 3x3, 3x4, 4x4… (smallest
+/// `cols` that keeps rows within `cols + 1`), capped by ~360px minimum tile
+/// width. Vertical overflow is handled by the caller's scroll fallback.
 fn pick_columns(avail: egui::Vec2, count: usize) -> usize {
     let cols_by_width = (((avail.x + GRID_SPACING) / (GRID_MIN_TILE_WIDTH + GRID_SPACING))
         .floor()
         .max(1.0)) as usize;
-    let cap = cols_by_width.min(count);
-    let min_tile_height = GRID_MIN_TILE_WIDTH / (16.0 / 9.0);
-    let rows_by_height = (((avail.y + GRID_SPACING) / (min_tile_height + GRID_SPACING))
-        .floor()
-        .max(1.0)) as usize;
     let mut cols = 1;
-    while cols < cap && count.div_ceil(cols) > rows_by_height {
+    while cols * (cols + 1) < count {
         cols += 1;
     }
-    cols
+    cols.min(cols_by_width).min(count).max(1)
 }
 
 struct GridTileLayout {
@@ -1296,7 +1310,6 @@ fn draw_grid_rows(
     ui: &mut egui::Ui,
     cameras: &mut [CameraView],
     layout: GridTileLayout,
-    paused: bool,
     badge_position: BadgePosition,
     opened: &mut Option<usize>,
 ) {
@@ -1314,7 +1327,6 @@ fn draw_grid_rows(
                     cam,
                     egui::vec2(layout.tile_w, layout.tile_h),
                     true,
-                    paused,
                     badge_position,
                 );
                 if clicked && opened.is_none() {
@@ -1334,7 +1346,6 @@ fn video_surface(
     cam: &mut CameraView,
     size: egui::Vec2,
     overlays: bool,
-    paused: bool,
     badge_position: BadgePosition,
 ) -> bool {
     let size = size.max(egui::vec2(80.0, 60.0));
@@ -1342,29 +1353,25 @@ fn video_surface(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme::SOOT_2);
 
-    if paused {
-        center_message(&painter, rect, format!("{}: paused", cam.name));
-    } else {
-        match cam.stream.latest_frame() {
-            Some(frame) => {
-                let tex = ensure_texture(ui.ctx(), cam, &frame);
-                let draw = fit_rect(rect, frame.width as f32, frame.height as f32);
-                painter.image(
-                    tex.id(),
-                    draw,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-            }
-            None => {
-                let msg = match cam.stream.status() {
-                    Status::Online => format!("{}: waiting for frames...", cam.name),
-                    Status::Connecting => format!("{}: connecting...", cam.name),
-                    Status::Offline => format!("{}: offline", cam.name),
-                    Status::Paused => format!("{}: paused", cam.name),
-                };
-                center_message(&painter, rect, msg);
-            }
+    match cam.stream.latest_frame() {
+        Some(frame) => {
+            let tex = ensure_texture(ui.ctx(), cam, &frame);
+            let draw = fit_rect(rect, frame.width as f32, frame.height as f32);
+            painter.image(
+                tex.id(),
+                draw,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        None => {
+            let msg = match cam.stream.status() {
+                Status::Online => format!("{}: waiting for frames...", cam.name),
+                Status::Connecting => format!("{}: connecting...", cam.name),
+                Status::Offline => format!("{}: offline", cam.name),
+                Status::Paused => format!("{}: paused", cam.name),
+            };
+            center_message(&painter, rect, msg);
         }
     }
 
@@ -1423,12 +1430,7 @@ fn center_message(painter: &egui::Painter, rect: egui::Rect, text: impl Into<Str
 // Solo view
 // ---------------------------------------------------------------------------
 
-fn show_solo(
-    ctx: &egui::Context,
-    cam: &mut CameraView,
-    paused: bool,
-    badge_position: BadgePosition,
-) -> bool {
+fn show_solo(ctx: &egui::Context, cam: &mut CameraView, badge_position: BadgePosition) -> bool {
     let mut back = false;
 
     egui::TopBottomPanel::top("solo_top")
@@ -1492,7 +1494,7 @@ fn show_solo(
                 }),
         )
         .show(ctx, |ui| {
-            video_surface(ui, cam, ui.available_size(), false, paused, badge_position);
+            video_surface(ui, cam, ui.available_size(), false, badge_position);
         });
 
     back
@@ -1597,7 +1599,7 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
             ui.label(
                 egui::RichText::new("SETTINGS")
                     .font(theme::display_font(30.0))
-                    .color(theme::INK),
+                    .color(theme::PAPER),
             );
             ui.label(theme::micro_label(
                 format!(
@@ -1618,6 +1620,7 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
             let mut delete = None;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
+                .max_height(ui.available_height() - 50.0)
                 .show(ui, |ui| {
                     for (i, row) in editor.rows.iter_mut().enumerate() {
                         settings_row(ui, i, row, &mut delete);
@@ -1656,19 +1659,54 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
                         ui,
                         egui::vec2(add_width, 34.0),
                         "+ ADD CAMERA",
-                        BtnVariant::Paper,
+                        BtnVariant::Confirm,
                     ) {
                         editor.add_row();
                     }
                 });
 
+            if let Some(index) = delete {
+                editor.rows.remove(index);
+            }
+
+            let dirty = editor.is_dirty();
+            if dirty && editor.confirm_discard {
+                ui.add_space(8.0);
+                ui.label(theme::micro_label(
+                    "UNSAVED CHANGES \u{2014} PRESS CANCEL AGAIN TO DISCARD THEM",
+                    theme::STATUS_OFFLINE,
+                ));
+            }
+
             ui.add_space(12.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::brutal_button(ui, "SAVE", BtnVariant::Ink) {
+                let saved = ui
+                    .scope(|ui| {
+                        if !dirty {
+                            ui.disable();
+                        }
+                        theme::brutal_button(ui, "SAVE", BtnVariant::Confirm)
+                    })
+                    .inner;
+                if saved {
                     action = SettingsAction::Save;
                 }
-                if theme::brutal_button(ui, "CANCEL", BtnVariant::Paper) {
-                    action = SettingsAction::Cancel;
+
+                // A reflex CANCEL/Escape shouldn't silently drop an edit: the
+                // first press while dirty only arms the discard, a second
+                // press (here or via Escape) confirms it.
+                let armed = dirty && editor.confirm_discard;
+                let (label, variant) = if armed {
+                    ("CONFIRM DISCARD", BtnVariant::Danger)
+                } else {
+                    ("CANCEL", BtnVariant::Ink)
+                };
+                if theme::brutal_button(ui, label, variant) {
+                    if dirty && !editor.confirm_discard {
+                        editor.confirm_discard = true;
+                    } else {
+                        action = SettingsAction::Cancel;
+                    }
                 }
             });
         });
@@ -1689,9 +1727,9 @@ fn badge_position_row(ui: &mut egui::Ui, editor: &mut SettingsEditor) {
                 ui,
                 label,
                 if selected {
-                    BtnVariant::Ink
-                } else {
                     BtnVariant::Paper
+                } else {
+                    BtnVariant::Ink
                 },
             ) {
                 editor.badge_position = option;
@@ -1707,21 +1745,14 @@ fn settings_row(
     row: &mut SettingsRow,
     delete: &mut Option<usize>,
 ) {
-    let invalid = row.url.trim().is_empty();
-    let mut card = egui::Frame::new()
+    // An empty URL isn't an error — it just means the row is incomplete and
+    // `collect()` will silently skip it on save. A brand-new row starts this
+    // way, so it gets a calm note rather than the loud red "invalid" look.
+    let empty = row.url.trim().is_empty();
+    let card = egui::Frame::new()
         .fill(theme::PAPER_2)
-        .stroke(egui::Stroke::new(
-            2.0_f32,
-            if invalid {
-                theme::STATUS_OFFLINE
-            } else {
-                theme::INK
-            },
-        ))
+        .stroke(egui::Stroke::new(2.0_f32, theme::INK))
         .inner_margin(egui::Margin::same(12));
-    if invalid {
-        card = card.shadow(theme::hard_shadow(theme::STATUS_OFFLINE));
-    }
     card.show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
@@ -1733,25 +1764,14 @@ fn settings_row(
                 let url_edit = egui::TextEdit::singleline(&mut row.url)
                     .hint_text("rtsp://user:pass@ip:554/path")
                     .font(theme::mono_font(11.5))
-                    .text_color(if invalid {
-                        theme::STATUS_OFFLINE
-                    } else {
-                        theme::INK
-                    });
+                    .text_color(theme::INK);
                 let width = (ui.available_width() - 92.0).max(160.0);
-                if invalid {
-                    ui.scope(|ui| {
-                        let visuals = ui.visuals_mut();
-                        visuals.widgets.inactive.bg_stroke =
-                            egui::Stroke::new(2.0_f32, theme::STATUS_OFFLINE);
-                        visuals.widgets.hovered.bg_stroke =
-                            egui::Stroke::new(2.0_f32, theme::STATUS_OFFLINE);
-                        visuals.widgets.active.bg_stroke =
-                            egui::Stroke::new(2.0_f32, theme::STATUS_OFFLINE);
-                        ui.add_sized([width, 28.0], url_edit);
-                    });
-                } else {
-                    ui.add_sized([width, 28.0], url_edit);
+                ui.add_sized([width, 28.0], url_edit);
+                if empty {
+                    ui.label(theme::micro_label(
+                        "EMPTY \u{2014} WON'T BE SAVED",
+                        theme::LABEL_ON_PAPER,
+                    ));
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1769,7 +1789,7 @@ fn paper_visuals(ui: &mut egui::Ui) {
     v.extreme_bg_color = theme::PAPER;
     v.faint_bg_color = theme::PAPER_2;
     v.selection.bg_fill = theme::INK;
-    v.selection.stroke = egui::Stroke::new(1.0_f32, theme::PAPER);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, theme::STATUS_OFFLINE);
     v.error_fg_color = theme::STATUS_OFFLINE;
     v.warn_fg_color = theme::STATUS_CONNECTING;
     v.weak_text_color = Some(theme::LABEL_ON_PAPER);
@@ -1781,7 +1801,12 @@ fn paper_visuals(ui: &mut egui::Ui) {
     ] {
         state.bg_stroke = egui::Stroke::new(2.0_f32, theme::INK);
         state.fg_stroke = egui::Stroke::new(1.0_f32, theme::INK);
+        // Buttons/ComboBox paint their background with `weak_bg_fill`, not
+        // `bg_fill` (that one's for checkboxes/sliders) — without this they
+        // kept the dark global theme's fill and looked disabled on paper.
+        state.weak_bg_fill = theme::PAPER_2;
     }
+    v.widgets.inactive.bg_fill = theme::PAPER_2;
     v.widgets.hovered.bg_fill = theme::PAPER_2;
     v.widgets.active.bg_fill = theme::PAPER_2;
 }
@@ -1895,6 +1920,16 @@ mod tests {
     }
 
     #[test]
+    fn merge_cameras_treats_default_and_explicit_rtsp_port_as_the_same_camera() {
+        // Manually-configured URLs usually omit the default RTSP port (554);
+        // discovery always states it explicitly. A raw string comparison
+        // missed this and re-added the same physical camera as a duplicate.
+        let existing = vec![camera("Cochera", "rtsp://192.168.100.6/live/ch0")];
+        let extra = vec![camera("Generic 192.168.100.6", "rtsp://192.168.100.6:554/live/ch0")];
+        assert_eq!(merge_cameras(&existing, extra), existing);
+    }
+
+    #[test]
     fn discovered_name_uses_vendor_guess_or_sequential_fallback() {
         let ip = Ipv4Addr::new(192, 168, 1, 64);
         assert_eq!(
@@ -2002,74 +2037,6 @@ mod tests {
         reconcile_rows(&mut rows, &later, &existing);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].result.ip, Ipv4Addr::new(192, 168, 1, 31));
-    }
-
-    #[test]
-    fn pauses_only_after_grace_period_then_resumes_on_focus() {
-        let mut tracker = FocusTracker::new();
-        let t0 = Instant::now();
-
-        assert_eq!(tracker.observe(false, t0), FocusChange::None);
-        assert!(!tracker.paused());
-
-        assert_eq!(
-            tracker.observe(false, t0 + PAUSE_AFTER_UNFOCUSED - Duration::from_secs(1)),
-            FocusChange::None
-        );
-        assert!(!tracker.paused());
-
-        assert_eq!(
-            tracker.observe(false, t0 + PAUSE_AFTER_UNFOCUSED),
-            FocusChange::EnteredPause
-        );
-        assert!(tracker.paused());
-
-        assert_eq!(
-            tracker.observe(false, t0 + PAUSE_AFTER_UNFOCUSED + Duration::from_secs(30)),
-            FocusChange::None
-        );
-        assert!(tracker.paused());
-
-        assert_eq!(
-            tracker.observe(true, t0 + PAUSE_AFTER_UNFOCUSED + Duration::from_secs(31)),
-            FocusChange::ExitedPause
-        );
-        assert!(!tracker.paused());
-
-        assert_eq!(
-            tracker.observe(true, t0 + PAUSE_AFTER_UNFOCUSED + Duration::from_secs(32)),
-            FocusChange::None
-        );
-        assert!(!tracker.paused());
-    }
-
-    #[test]
-    fn refocus_resets_grace_period_without_flapping_pauses() {
-        let mut tracker = FocusTracker::new();
-        let t0 = Instant::now();
-
-        assert_eq!(tracker.observe(false, t0), FocusChange::None);
-        assert_eq!(
-            tracker.observe(false, t0 + Duration::from_secs(9)),
-            FocusChange::None
-        );
-        assert_eq!(
-            tracker.observe(true, t0 + Duration::from_secs(10)),
-            FocusChange::None
-        );
-        assert_eq!(
-            tracker.observe(false, t0 + Duration::from_secs(11)),
-            FocusChange::None
-        );
-        assert_eq!(
-            tracker.observe(false, t0 + Duration::from_secs(20)),
-            FocusChange::None
-        );
-        assert_eq!(
-            tracker.observe(false, t0 + Duration::from_secs(21)),
-            FocusChange::EnteredPause
-        );
-        assert!(tracker.paused());
     }
 
     /// Live pipeline against TEST-NET-1 (RFC 5737, silently unroutable):
