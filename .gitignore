@@ -2,3 +2,4 @@
 *.log
 cameras.toml
 .atl/
+/dist
