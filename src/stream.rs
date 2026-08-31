@@ -93,6 +93,25 @@ impl Drop for StreamHandle {
     }
 }
 
+/// Builds a `Command` that never opens a console window on Windows.
+///
+/// Every ffmpeg/ffprobe spawn must go through here: a GUI process spawning a
+/// console subsystem child makes Windows allocate a console for it, which
+/// flashes a black window on screen (once per reconnect, per camera).
+#[cfg(windows)]
+pub(crate) fn no_window_command(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(not(windows))]
+pub(crate) fn no_window_command(program: &str) -> Command {
+    Command::new(program)
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -128,7 +147,7 @@ pub enum ProbeOutcome {
 }
 
 pub fn probe_rtsp(url: &str, timeout: Duration) -> ProbeOutcome {
-    let mut command = Command::new("ffprobe");
+    let mut command = no_window_command("ffprobe");
     command.args([
         "-v",
         "error",
@@ -274,7 +293,7 @@ fn run_loop(shared: Shared, url: &str) {
             continue;
         }
 
-        let child = Command::new("ffmpeg")
+        let child = no_window_command("ffmpeg")
             .args(["-loglevel", "error", "-rtsp_transport", "tcp", "-i", url])
             .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
             .stdout(Stdio::piped())

@@ -1,3 +1,7 @@
+// Windows assigns a console to console-subsystem binaries, so launching the app
+// from the shell or a shortcut pops a cmd window next to the GUI.
+#![windows_subsystem = "windows"]
+
 use cam_viewer::{app::CamViewerApp, config};
 use eframe::egui;
 

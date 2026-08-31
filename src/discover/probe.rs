@@ -6,7 +6,7 @@ use crate::discover::{AuthStatus, DiscoveryResult};
 use crate::stream::{self, ProbeOutcome};
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
@@ -124,7 +124,7 @@ fn probe_host(
 /// (consumed by the orchestrator as `Phase::Failed`) instead of being mistaken
 /// for per-host Unreachable outcomes — scan results survive that path.
 pub fn ffprobe_available() -> bool {
-    Command::new("ffprobe")
+    crate::stream::no_window_command("ffprobe")
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
