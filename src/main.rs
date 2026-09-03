@@ -6,6 +6,14 @@ use cam_viewer::{app::CamViewerApp, config};
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // Answered before any window opens. Note that the Windows GUI subsystem
+    // gives the process no console, so this print is only visible where one is
+    // already attached; attaching one needs FFI, which this crate forbids.
+    if std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V") {
+        println!("cam-viewer {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let path = config::config_path();
     let cfg = match config::load(&path) {
         Ok(cfg) => cfg,
