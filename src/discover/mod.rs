@@ -24,12 +24,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Authentication outcome for a discovered host.
+/// Why a discovered host can or cannot be added as it stands.
 ///
-/// `NeedsCredentials` is warning-row scaffolding: per spec REQ-10 such hosts
-/// render as rows with a warning dot and a DISABLED checkbox.
+/// Renamed from `AuthStatus` once it stopped being purely about credentials:
+/// `PathUnknown` is a live RTSP server whose stream path is simply not in the
+/// vendor table, which has nothing to do with authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthStatus {
+pub enum RowStatus {
     /// Streams anonymously.
     Open,
     /// Succeeded with the global credential pair.
@@ -37,6 +38,11 @@ pub enum AuthStatus {
     /// Best outcome was BadCredentials-only; not addable until credentials
     /// are supplied and a rescan succeeds.
     NeedsCredentials,
+    /// The host speaks RTSP — it answered a DESCRIBE with "path not found" —
+    /// but no path in [`probe::VENDOR_PATHS`] matched. The camera is real and
+    /// reachable; only its path is unknown, so the user can supply one rather
+    /// than the host vanishing from the results entirely.
+    PathUnknown,
 }
 
 /// One discovered host: best outcome, working URL (lowest-port success
@@ -46,12 +52,15 @@ pub enum AuthStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscoveryResult {
     pub ip: Ipv4Addr,
+    /// Responding port this row was derived from. Needed to build a URL for a
+    /// `PathUnknown` host, where no working URL exists to read it back out of.
+    pub port: u16,
     /// Working URL with credentials embedded verbatim; None unless probing
     /// achieved Success.
     pub url: Option<String>,
     pub vendor: Option<String>,
     pub resolution: Option<(usize, usize)>,
-    pub auth: AuthStatus,
+    pub auth: RowStatus,
 }
 
 /// Lifecycle phases of a discovery run.

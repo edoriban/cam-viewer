@@ -2,7 +2,7 @@
 //! process-backed probe pool (spec REQ-6, REQ-7, REQ-9, REQ-10).
 
 use crate::discover::scan::Responder;
-use crate::discover::{AuthStatus, DiscoveryResult};
+use crate::discover::{RowStatus, DiscoveryResult};
 use crate::stream::{self, ProbeOutcome};
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -30,15 +30,27 @@ pub const DISCOVER_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Data-driven vendor path table: `(vendor label, RTSP path)`. New vendors
 /// are one table row; candidate generation needs no logic change (REQ-7).
+/// Ordered by how often a path is observed in the wild, because probing stops
+/// at the first success: a common path late in the table costs every host the
+/// attempts above it. Each row also lengthens the worst case for hosts that
+/// match nothing, since [`MAX_ATTEMPTS_PER_HOST`] tracks this length.
 pub const VENDOR_PATHS: &[(&str, &str)] = &[
     ("Hikvision", "/Streaming/Channels/101"),
     ("Dahua/Amcrest", "/cam/realmonitor?channel=1&subtype=0"),
+    ("Generic", "/live/ch0"),
     ("TP-Link", "/stream1"),
     ("Reolink", "/h264Preview_01_main"),
     ("Reolink ONVIF", "/onvif1"),
     ("Axis", "/axis-media/media.amp"),
     ("Foscam", "/videoMain"),
-    ("Generic", "/live/ch0"),
+    ("Uniview", "/media/video1"),
+    ("Vivotek", "/live.sdp"),
+    ("XMeye/Sofia", "/live/ch00_0"),
+    ("Bosch", "/rtsp_tunnel"),
+    ("Panasonic", "/MediaInput/h264"),
+    ("Generic 264", "/live0.264"),
+    ("Generic stream", "/stream0"),
+    ("Generic channel", "/11"),
     ("Root", "/"),
 ];
 
@@ -67,9 +79,12 @@ pub fn candidate_urls(ip: Ipv4Addr, port: u16, creds: Option<(&str, &str)>) -> V
 ///   next path on the same port.
 /// - At most `max_attempts` closure invocations happen per host.
 ///
-/// Returns a result row only when the host earned one per REQ-10: a Success
-/// (Open or Authenticated) or a BadCredentials-only best outcome
-/// (`NeedsCredentials`). Transport/service-failure hosts yield `None`.
+/// Returns a result row when the host earned one: a Success (Open or
+/// Authenticated), a BadCredentials-only best outcome (`NeedsCredentials`),
+/// or a host that answered PathNotFound and so proved it speaks RTSP without
+/// matching any known path (`PathUnknown`). Only hosts that never behaved
+/// like an RTSP service at all — PortClosed, Unreachable, NotRtsp throughout
+/// — yield `None`.
 fn probe_host(
     ip: Ipv4Addr,
     ports: &[u16],
@@ -78,7 +93,12 @@ fn probe_host(
     attempt: &mut dyn FnMut(&str) -> ProbeOutcome,
 ) -> Option<DiscoveryResult> {
     let mut attempts = 0usize;
-    let mut saw_bad_credentials = false;
+    let mut saw_bad_credentials: Option<u16> = None;
+    // A PathNotFound answer proves something on the other end speaks RTSP and
+    // simply rejected the path we guessed. That host is a real camera the
+    // vendor table does not cover, and dropping it silently is how a camera
+    // becomes invisible to the wizard.
+    let mut saw_live_rtsp: Option<u16> = None;
     'host: for port in ports {
         let urls = candidate_urls(ip, *port, creds);
         for (url, (vendor, _)) in urls.iter().zip(VENDOR_PATHS) {
@@ -89,12 +109,13 @@ fn probe_host(
             match attempt(url) {
                 ProbeOutcome::Success { width, height } => {
                     let auth = if creds.is_some() {
-                        AuthStatus::Authenticated
+                        RowStatus::Authenticated
                     } else {
-                        AuthStatus::Open
+                        RowStatus::Open
                     };
                     return Some(DiscoveryResult {
                         ip,
+                        port: *port,
                         url: Some(url.clone()),
                         vendor: Some((*vendor).to_owned()),
                         resolution: Some((width, height)),
@@ -102,23 +123,36 @@ fn probe_host(
                     });
                 }
                 ProbeOutcome::BadCredentials => {
-                    saw_bad_credentials = true;
+                    saw_bad_credentials.get_or_insert(*port);
                     continue 'host;
                 }
-                ProbeOutcome::PathNotFound => {}
+                ProbeOutcome::PathNotFound => {
+                    saw_live_rtsp.get_or_insert(*port);
+                }
                 ProbeOutcome::PortClosed | ProbeOutcome::Unreachable | ProbeOutcome::NotRtsp => {
                     continue 'host;
                 }
             }
         }
     }
-    if saw_bad_credentials {
+    if let Some(port) = saw_bad_credentials {
         return Some(DiscoveryResult {
             ip,
+            port,
             url: None,
             vendor: None,
             resolution: None,
-            auth: AuthStatus::NeedsCredentials,
+            auth: RowStatus::NeedsCredentials,
+        });
+    }
+    if let Some(port) = saw_live_rtsp {
+        return Some(DiscoveryResult {
+            ip,
+            port,
+            url: None,
+            vendor: None,
+            resolution: None,
+            auth: RowStatus::PathUnknown,
         });
     }
     None
@@ -297,7 +331,7 @@ mod tests {
 #[cfg(test)]
 mod policy_tests {
     use super::{MAX_ATTEMPTS_PER_HOST, VENDOR_PATHS, candidate_urls, probe_host};
-    use crate::discover::AuthStatus;
+    use crate::discover::RowStatus;
     use crate::stream::ProbeOutcome;
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -344,7 +378,7 @@ mod policy_tests {
         let result = probe_host(IP, &[PORT_A], None, MAX_ATTEMPTS_PER_HOST, &mut attempt)
             .expect("last-path camera must produce a row");
         assert_eq!(result.url.as_deref(), Some(last_url.as_str()));
-        assert_eq!(result.auth, AuthStatus::Open);
+        assert_eq!(result.auth, RowStatus::Open);
     }
 
     #[test]
@@ -372,7 +406,7 @@ mod policy_tests {
         );
         let expected_url = &candidate_urls(IP, PORT_A, None)[1];
         assert_eq!(result.url.as_deref(), Some(expected_url.as_str()));
-        assert_eq!(result.auth, AuthStatus::Open, "anonymous success");
+        assert_eq!(result.auth, RowStatus::Open, "anonymous success");
         assert_eq!(result.resolution, Some((1920, 1080)));
         assert_eq!(result.vendor.as_deref(), Some(VENDOR_PATHS[1].0));
     }
@@ -394,7 +428,7 @@ mod policy_tests {
         );
 
         let result = result.expect("row");
-        assert_eq!(result.auth, AuthStatus::Authenticated);
+        assert_eq!(result.auth, RowStatus::Authenticated);
         assert!(result.url.expect("url").contains("admin:s3cret@"));
     }
 
@@ -414,7 +448,7 @@ mod policy_tests {
             2,
             "one auth hit per port: remaining paths are skipped (lockout safety)"
         );
-        assert_eq!(result.auth, AuthStatus::NeedsCredentials);
+        assert_eq!(result.auth, RowStatus::NeedsCredentials);
         assert!(
             result.url.is_none(),
             "no addable working URL without success"
@@ -431,12 +465,32 @@ mod policy_tests {
 
         let result = probe_host(IP, &[PORT_A, PORT_B], None, 100, &mut attempt);
 
-        assert!(result.is_none(), "path-not-found-only hosts render no rows");
+        // Behaviour change: such a host used to vanish. It answers DESCRIBE,
+        // so it is a real camera the vendor table does not cover, and it is
+        // now surfaced for the user to supply a path.
+        let result = result.expect("a live RTSP host must produce a row");
+        assert_eq!(result.auth, RowStatus::PathUnknown);
+        assert!(result.url.is_none(), "no path matched, so no working URL");
         assert_eq!(
             attempts.load(Ordering::Relaxed),
             VENDOR_PATHS.len() * 2,
             "wrong path keeps trying candidates: full P x T matrix walked"
         );
+    }
+
+    #[test]
+    fn host_that_never_speaks_rtsp_is_still_dropped() {
+        // The complement of the case above: PathUnknown must not become a
+        // catch-all that fills the results with every open port on the LAN.
+        for outcome in [
+            ProbeOutcome::PortClosed,
+            ProbeOutcome::Unreachable,
+            ProbeOutcome::NotRtsp,
+        ] {
+            let mut attempt = |_: &str| outcome;
+            let result = probe_host(IP, &[PORT_A, PORT_B], None, 100, &mut attempt);
+            assert!(result.is_none(), "{outcome:?} must not produce a row");
+        }
     }
 
     #[test]

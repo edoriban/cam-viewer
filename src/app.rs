@@ -3,7 +3,7 @@ use crate::discover::net::{self, InterfaceInfo};
 use crate::discover::probe::DISCOVER_PROBE_TIMEOUT;
 use crate::discover::scan::DEFAULT_PORTS;
 use crate::discover::{
-    AuthStatus, DiscoveryConfig, DiscoveryHandle, DiscoveryResult, DiscoverySnapshot, Phase,
+    RowStatus, DiscoveryConfig, DiscoveryHandle, DiscoveryResult, DiscoverySnapshot, Phase,
 };
 use crate::stream::{Status, StreamHandle};
 use crate::theme::{self, BtnVariant};
@@ -126,6 +126,9 @@ struct DiscoverRow {
     checked: bool,
     duplicate: bool,
     exact_duplicate: bool,
+    /// Path typed by the user for a `PathUnknown` host. Preserved across
+    /// frames by `reconcile_rows`, which only refreshes `result`.
+    manual_path: String,
 }
 
 impl DiscoverRow {
@@ -135,18 +138,35 @@ impl DiscoverRow {
             checked: false,
             duplicate: false,
             exact_duplicate: false,
+            manual_path: String::new(),
         }
     }
 
-    /// Enabled-checkbox semantics per REQ-10: only credentialed/open hosts
-    /// with a working URL are addable; exact duplicates are excluded.
+    /// URL this row would contribute: the probed one, or one assembled from a
+    /// hand-typed path when the host speaks RTSP but matched no known path.
+    ///
+    /// Global credentials are deliberately not injected here: a host that
+    /// needed them would have answered BadCredentials and be
+    /// `NeedsCredentials`, not `PathUnknown`.
+    fn effective_url(&self) -> Option<String> {
+        if let Some(url) = &self.result.url {
+            return Some(url.clone());
+        }
+        if self.result.auth != RowStatus::PathUnknown {
+            return None;
+        }
+        let path = normalized_path(&self.manual_path)?;
+        Some(format!(
+            "rtsp://{}:{}{}",
+            self.result.ip, self.result.port, path
+        ))
+    }
+
+    /// Enabled-checkbox semantics: a row is addable once it can name a URL and
+    /// is not already configured. For `PathUnknown` that means the user has
+    /// typed a usable path.
     fn addable(&self) -> bool {
-        self.result.url.is_some()
-            && matches!(
-                self.result.auth,
-                AuthStatus::Open | AuthStatus::Authenticated
-            )
-            && !self.exact_duplicate
+        self.effective_url().is_some() && !self.exact_duplicate
     }
 
     fn key(&self) -> String {
@@ -220,6 +240,21 @@ fn merge_cameras(existing: &[CameraConfig], extra: Vec<CameraConfig>) -> Vec<Cam
     merged
 }
 
+/// A hand-typed RTSP path made usable: trimmed and forced to a single leading
+/// slash. `None` for input that names no path, including a bare `/`, which the
+/// vendor table already probed and which therefore cannot be the answer here.
+fn normalized_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return None;
+    }
+    let without_slashes = trimmed.trim_start_matches('/');
+    if without_slashes.is_empty() {
+        return None;
+    }
+    Some(format!("/{without_slashes}"))
+}
+
 /// `{vendor} {ip}`, falling back to the sequential `Cam N` convention.
 fn discovered_name(vendor: Option<&str>, ip: Ipv4Addr, fallback: usize) -> String {
     match vendor {
@@ -240,7 +275,7 @@ fn selected_cameras(rows: &[DiscoverRow], existing_count: usize) -> Vec<CameraCo
                 row.result.ip,
                 existing_count + i + 1,
             ),
-            url: row.result.url.clone().unwrap_or_default(),
+            url: row.effective_url().unwrap_or_default(),
         })
         .collect()
 }
@@ -694,9 +729,15 @@ fn discover_row_card(ui: &mut egui::Ui, row: &mut DiscoverRow) {
                         let detail = match (&row.result.url, row.result.resolution) {
                             (Some(url), Some((w, h))) => format!("{url}  \u{b7}  {w}\u{d7}{h}"),
                             (Some(url), None) => url.clone(),
-                            (None, _) => {
-                                String::from("NO WORKING URL \u{2014} AUTHENTICATION REQUIRED")
-                            }
+                            (None, _) => match row.result.auth {
+                                RowStatus::PathUnknown => format!(
+                                    "RTSP ON PORT {} \u{2014} STREAM PATH NOT RECOGNISED",
+                                    row.result.port
+                                ),
+                                _ => String::from(
+                                    "NO WORKING URL \u{2014} AUTHENTICATION REQUIRED",
+                                ),
+                            },
                         };
                         let shown = theme::elide_to_width(
                             ui.painter(),
@@ -709,6 +750,27 @@ fn discover_row_card(ui: &mut egui::Ui, row: &mut DiscoverRow) {
                     });
                 });
             });
+            // Outside the fade above on purpose: this row is disabled precisely
+            // because no path is known, so the control that fixes that has to
+            // stay usable.
+            if row.result.auth == RowStatus::PathUnknown && !row.exact_duplicate {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(theme::micro_label("PATH", theme::LABEL_ON_PAPER));
+                    let hint = format!("rtsp://{}:{}", row.result.ip, row.result.port);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut row.manual_path)
+                            .hint_text("/media/video1")
+                            .desired_width(200.0)
+                            .font(theme::mono_font(11.0)),
+                    );
+                    let preview = match normalized_path(&row.manual_path) {
+                        Some(path) => format!("{hint}{path}"),
+                        None => String::from("type the camera's stream path to add it"),
+                    };
+                    ui.label(theme::micro_label(preview, theme::LABEL_ON_PAPER));
+                });
+            }
             // Drawn at full contrast, outside the fade above: this is the
             // reason the row is disabled, so it must stay legible.
             if row.exact_duplicate {
@@ -720,10 +782,10 @@ fn discover_row_card(ui: &mut egui::Ui, row: &mut DiscoverRow) {
 }
 
 /// Auth-status dot color per REQ-10 / design mapping.
-fn auth_color(auth: AuthStatus) -> egui::Color32 {
+fn auth_color(auth: RowStatus) -> egui::Color32 {
     match auth {
-        AuthStatus::Authenticated | AuthStatus::Open => theme::STATUS_ONLINE,
-        AuthStatus::NeedsCredentials => theme::STATUS_CONNECTING,
+        RowStatus::Authenticated | RowStatus::Open => theme::STATUS_ONLINE,
+        RowStatus::NeedsCredentials | RowStatus::PathUnknown => theme::STATUS_CONNECTING,
     }
 }
 
@@ -732,7 +794,7 @@ fn auth_legend(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         for (color, label) in [
             (theme::STATUS_ONLINE, "OPEN / AUTHENTICATED \u{2014} ADDABLE"),
-            (theme::STATUS_CONNECTING, "NEEDS CREDENTIALS"),
+            (theme::STATUS_CONNECTING, "NEEDS CREDENTIALS / PATH"),
         ] {
             let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
             ui.painter().rect_filled(dot, 0.0, color);
@@ -1957,17 +2019,103 @@ fn fit_rect(rect: egui::Rect, w: f32, h: f32) -> egui::Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discover::AuthStatus;
+    use crate::discover::RowStatus;
     use std::net::Ipv4Addr;
 
-    fn result(ip: [u8; 4], url: Option<&str>, auth: AuthStatus) -> DiscoveryResult {
+    fn result(ip: [u8; 4], url: Option<&str>, auth: RowStatus) -> DiscoveryResult {
         DiscoveryResult {
             ip: Ipv4Addr::from(ip),
+            port: 554,
             url: url.map(str::to_owned),
             vendor: None,
             resolution: None,
             auth,
         }
+    }
+
+    fn unknown_path_row(ip: [u8; 4], port: u16) -> DiscoverRow {
+        DiscoverRow::new(DiscoveryResult {
+            ip: Ipv4Addr::from(ip),
+            port,
+            url: None,
+            vendor: None,
+            resolution: None,
+            auth: RowStatus::PathUnknown,
+        })
+    }
+
+    #[test]
+    fn typed_path_is_normalised_to_one_leading_slash() {
+        assert_eq!(normalized_path("/media/video1").as_deref(), Some("/media/video1"));
+        assert_eq!(normalized_path("media/video1").as_deref(), Some("/media/video1"));
+        assert_eq!(normalized_path("  /live.sdp  ").as_deref(), Some("/live.sdp"));
+        assert_eq!(normalized_path("//live").as_deref(), Some("/live"));
+    }
+
+    #[test]
+    fn input_that_names_no_path_is_rejected() {
+        // A bare "/" is already in the vendor table and already failed, so it
+        // cannot be the answer for a PathUnknown host.
+        for raw in ["", "   ", "/", "//", "\t"] {
+            assert_eq!(normalized_path(raw), None, "must reject {raw:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_path_row_is_not_addable_until_a_path_is_typed() {
+        let mut row = unknown_path_row([192, 168, 1, 90], 554);
+        assert!(!row.addable(), "nothing typed yet");
+        assert_eq!(row.effective_url(), None);
+
+        row.manual_path = "media/video1".to_owned();
+        assert!(row.addable(), "a typed path makes the row addable");
+        assert_eq!(
+            row.effective_url().as_deref(),
+            Some("rtsp://192.168.1.90:554/media/video1")
+        );
+    }
+
+    #[test]
+    fn typed_path_url_uses_the_port_that_actually_responded() {
+        // Hardcoding 554 would silently produce a dead URL for this camera.
+        let mut row = unknown_path_row([10, 0, 0, 7], 8554);
+        row.manual_path = "/live.sdp".to_owned();
+        assert_eq!(
+            row.effective_url().as_deref(),
+            Some("rtsp://10.0.0.7:8554/live.sdp")
+        );
+    }
+
+    #[test]
+    fn credentials_row_stays_unaddable_even_with_a_typed_path() {
+        // Only PathUnknown accepts a hand-typed path; a host that answered
+        // BadCredentials still needs credentials and a rescan.
+        let mut row = DiscoverRow::new(result([192, 168, 1, 91], None, RowStatus::NeedsCredentials));
+        row.manual_path = "/live".to_owned();
+        assert_eq!(row.effective_url(), None);
+        assert!(!row.addable());
+    }
+
+    #[test]
+    fn typed_path_reaches_the_saved_camera_list() {
+        let mut row = unknown_path_row([192, 168, 1, 92], 554);
+        row.manual_path = "/cam/stream".to_owned();
+        row.checked = true;
+        let cameras = selected_cameras(&[row], 0);
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(cameras[0].url, "rtsp://192.168.1.92:554/cam/stream");
+    }
+
+    #[test]
+    fn a_typed_path_survives_a_results_refresh() {
+        // reconcile_rows runs every frame while scanning; losing the field
+        // mid-typing would make it unusable.
+        let mut rows = vec![unknown_path_row([192, 168, 1, 93], 554)];
+        rows[0].manual_path = "/half-typ".to_owned();
+        let refreshed = vec![rows[0].result.clone()];
+        reconcile_rows(&mut rows, &refreshed, &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].manual_path, "/half-typ");
     }
 
     fn camera(name: &str, url: &str) -> CameraConfig {
@@ -2055,19 +2203,19 @@ mod tests {
         let mut hit = DiscoverRow::new(result(
             [192, 168, 1, 64],
             Some("rtsp://192.168.1.64:554/x"),
-            AuthStatus::Authenticated,
+            RowStatus::Authenticated,
         ));
         hit.result.vendor = Some("Hikvision".to_owned());
         hit.checked = true;
         let unchecked = DiscoverRow::new(result(
             [192, 168, 1, 65],
             Some("rtsp://192.168.1.65/y"),
-            AuthStatus::Open,
+            RowStatus::Open,
         ));
         let mut already = DiscoverRow::new(result(
             [192, 168, 1, 66],
             Some("rtsp://192.168.1.66/z"),
-            AuthStatus::Authenticated,
+            RowStatus::Authenticated,
         ));
         already.checked = true;
         already.duplicate = true;
@@ -2075,7 +2223,7 @@ mod tests {
         let mut needs_creds = DiscoverRow::new(result(
             [192, 168, 1, 67],
             None,
-            AuthStatus::NeedsCredentials,
+            RowStatus::NeedsCredentials,
         ));
         needs_creds.checked = true;
 
@@ -2099,14 +2247,14 @@ mod tests {
             result(
                 [192, 168, 1, 10],
                 Some("rtsp://192.168.1.10:554/live"),
-                AuthStatus::Open,
+                RowStatus::Open,
             ),
             result(
                 [192, 168, 1, 20],
                 Some("rtsp://192.168.1.20:554/onvif1"),
-                AuthStatus::Authenticated,
+                RowStatus::Authenticated,
             ),
-            result([192, 168, 1, 40], None, AuthStatus::NeedsCredentials),
+            result([192, 168, 1, 40], None, RowStatus::NeedsCredentials),
         ];
         let mut rows = Vec::new();
         reconcile_rows(&mut rows, &results, &existing);
@@ -2127,12 +2275,12 @@ mod tests {
             result(
                 [192, 168, 1, 30],
                 Some("rtsp://192.168.1.30/a"),
-                AuthStatus::Open,
+                RowStatus::Open,
             ),
             result(
                 [192, 168, 1, 31],
                 Some("rtsp://192.168.1.31/b"),
-                AuthStatus::Open,
+                RowStatus::Open,
             ),
         ];
         let mut rows = Vec::new();
