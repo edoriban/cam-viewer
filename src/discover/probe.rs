@@ -15,7 +15,12 @@ use std::time::Duration;
 
 /// Hard cap on ffprobe attempts against a single host, regardless of how
 /// large the paths x ports matrix grows (Reconciliation 3; lockout safety).
-pub const MAX_ATTEMPTS_PER_HOST: usize = 8;
+///
+/// Derived from [`VENDOR_PATHS`] so the cap always covers exactly one full
+/// pass of the table on the first port. A hardcoded value silently truncates
+/// the table when a vendor row is appended: at 8 with 9 rows, `/live/ch0` was
+/// the last reachable attempt and `/` was never probed at all.
+pub const MAX_ATTEMPTS_PER_HOST: usize = VENDOR_PATHS.len();
 
 /// Worker count for the probe pool; bounds concurrent ffprobe processes.
 pub const PROBE_WORKERS: usize = 16;
@@ -25,7 +30,7 @@ pub const DISCOVER_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Data-driven vendor path table: `(vendor label, RTSP path)`. New vendors
 /// are one table row; candidate generation needs no logic change (REQ-7).
-pub static VENDOR_PATHS: &[(&str, &str)] = &[
+pub const VENDOR_PATHS: &[(&str, &str)] = &[
     ("Hikvision", "/Streaming/Channels/101"),
     ("Dahua/Amcrest", "/cam/realmonitor?channel=1&subtype=0"),
     ("TP-Link", "/stream1"),
@@ -305,6 +310,41 @@ mod policy_tests {
     fn scripted(outcomes: Vec<ProbeOutcome>) -> impl FnMut(&str) -> ProbeOutcome {
         let mut outcomes = outcomes;
         move |_: &str| outcomes.remove(0)
+    }
+
+    #[test]
+    fn attempt_cap_covers_every_vendor_path_on_the_first_port() {
+        // Regression guard: the cap was hardcoded to 8 while the table held 9
+        // rows, so the last row was never probed. Appending a vendor must not
+        // silently truncate the table again.
+        assert!(
+            MAX_ATTEMPTS_PER_HOST >= VENDOR_PATHS.len(),
+            "cap {MAX_ATTEMPTS_PER_HOST} truncates the {}-row vendor table",
+            VENDOR_PATHS.len()
+        );
+    }
+
+    #[test]
+    fn last_vendor_path_is_reached_when_every_earlier_path_is_not_found() {
+        // Behavioural half of the guard above: a camera whose only working
+        // path is the final table row must still be discovered.
+        let last_url = candidate_urls(IP, PORT_A, None)
+            .pop()
+            .expect("table is non-empty");
+        let mut attempt = |url: &str| {
+            if url == last_url {
+                ProbeOutcome::Success {
+                    width: 1920,
+                    height: 1080,
+                }
+            } else {
+                ProbeOutcome::PathNotFound
+            }
+        };
+        let result = probe_host(IP, &[PORT_A], None, MAX_ATTEMPTS_PER_HOST, &mut attempt)
+            .expect("last-path camera must produce a row");
+        assert_eq!(result.url.as_deref(), Some(last_url.as_str()));
+        assert_eq!(result.auth, AuthStatus::Open);
     }
 
     #[test]
