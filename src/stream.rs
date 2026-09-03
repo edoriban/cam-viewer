@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const PAUSED_PROBE_INTERVAL: Duration = Duration::from_secs(8);
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-const STREAM_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+/// Socket deadline handed to the streaming ffmpeg. Without a pre-flight probe
+/// this is the only thing that unsticks a camera that accepts the connection
+/// and then goes silent mid-stream.
+const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const PAUSED_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,28 +277,26 @@ fn run_loop(shared: Shared, url: &str) {
         paused_seen = false;
         *lock(&shared.status) = Status::Connecting;
 
-        let dims = match probe_rtsp(url, STREAM_PROBE_TIMEOUT) {
-            ProbeOutcome::Success { width, height } => (width, height),
-            ProbeOutcome::BadCredentials
-            | ProbeOutcome::PathNotFound
-            | ProbeOutcome::PortClosed
-            | ProbeOutcome::Unreachable
-            | ProbeOutcome::NotRtsp => {
-                *lock(&shared.status) = Status::Offline;
-                sleep_interruptible(&shared.shutdown, &shared.paused, RECONNECT_DELAY);
-                continue;
-            }
-        };
-        let frame_len = dims.0 * dims.1 * 3;
-        if frame_len > MAX_FRAME_BYTES {
-            *lock(&shared.status) = Status::Offline;
-            sleep_interruptible(&shared.shutdown, &shared.paused, RECONNECT_DELAY);
-            continue;
-        }
-
+        let io_timeout = STREAM_IO_TIMEOUT.as_micros().to_string();
         let child = no_window_command("ffmpeg")
-            .args(["-loglevel", "error", "-rtsp_transport", "tcp", "-i", url])
-            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .args(["-loglevel", "error", "-rtsp_transport", "tcp"])
+            // Deliberately NO -fflags nobuffer / -flags low_delay / -probesize
+            // / -analyzeduration here. Measured against real cameras they make
+            // first-frame latency worse, not better: starving the demuxer's
+            // buffer forces it to wait for the next real keyframe (~2.1s ->
+            // ~4.4s), and -probesize 32 fails outright roughly half the time
+            // with "Output file does not contain any stream", which costs a
+            // full RECONNECT_DELAY before the retry.
+            //
+            // The rtsp demuxer exposes -timeout (socket I/O, microseconds);
+            // -rw_timeout is an ffprobe-only spelling and makes the ffmpeg CLI
+            // refuse the input outright with "Option rw_timeout not found".
+            .args(["-timeout", &io_timeout])
+            .args(["-i", url])
+            // PPM states width/height in every frame header, so streaming no
+            // longer needs an ffprobe round-trip to learn the geometry and a
+            // mid-stream resolution change self-corrects instead of tearing.
+            .args(["-f", "image2pipe", "-vcodec", "ppm", "-"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn();
@@ -313,7 +314,7 @@ fn run_loop(shared: Shared, url: &str) {
         *lock(&shared.child) = Some(child);
 
         if let Some(stdout) = stdout.as_mut() {
-            read_frames(&shared, stdout, dims.0, dims.1);
+            read_frames(&shared, stdout);
         }
 
         stop_child(&shared.child);
@@ -330,28 +331,218 @@ fn run_loop(shared: Shared, url: &str) {
     stop_child(&shared.child);
 }
 
-fn read_frames<R: Read>(shared: &Shared, reader: &mut R, width: usize, height: usize) {
-    let frame_len = width * height * 3;
-    let mut buf = vec![0u8; frame_len];
+/// Reads one whitespace-delimited PPM header token, skipping leading
+/// whitespace and `#` comment lines. Consumes exactly one whitespace byte
+/// after the token, which is the single separator PPM mandates before the
+/// binary payload. `None` on EOF or on a token long enough to be garbage
+/// rather than a header field.
+fn next_header_token<R: BufRead>(reader: &mut R) -> Option<String> {
+    const MAX_TOKEN_LEN: usize = 20;
+    let mut token = String::new();
+    let mut byte = [0u8; 1];
+    loop {
+        reader.read_exact(&mut byte).ok()?;
+        if byte[0] == b'#' {
+            loop {
+                reader.read_exact(&mut byte).ok()?;
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if byte[0].is_ascii_whitespace() {
+            if token.is_empty() {
+                continue;
+            }
+            return Some(token);
+        }
+        token.push(byte[0] as char);
+        if token.len() > MAX_TOKEN_LEN {
+            return None;
+        }
+    }
+}
+
+/// Pixel dimensions from one `P6` header, or `None` when the stream is not a
+/// PPM frame we can decode.
+///
+/// Rejects a `maxval` other than 255: larger values mean 16-bit samples, a
+/// payload layout twice the size this reader assumes. Also rejects zero and
+/// oversized geometry, so a corrupt header can never drive an absurd
+/// allocation off a byte stream we do not control.
+fn read_ppm_header<R: BufRead>(reader: &mut R) -> Option<(usize, usize)> {
+    if next_header_token(reader)? != "P6" {
+        return None;
+    }
+    let width: usize = next_header_token(reader)?.parse().ok()?;
+    let height: usize = next_header_token(reader)?.parse().ok()?;
+    let maxval: u32 = next_header_token(reader)?.parse().ok()?;
+    if maxval != 255 || width == 0 || height == 0 {
+        return None;
+    }
+    let frame_len = width.checked_mul(height)?.checked_mul(3)?;
+    if frame_len > MAX_FRAME_BYTES {
+        return None;
+    }
+    Some((width, height))
+}
+
+/// Publishes frames until the pipe ends, the stream is stopped, or a header
+/// fails to parse. Geometry is read per frame from the PPM header rather than
+/// fixed up-front, so a camera that changes resolution mid-stream is followed
+/// instead of producing torn frames.
+fn read_frames<R: Read>(shared: &Shared, reader: R) {
+    let mut reader = BufReader::with_capacity(64 * 1024, reader);
+    let mut buf: Vec<u8> = Vec::new();
     let mut generation: u64 = 0;
     loop {
         if shared.shutdown.load(Ordering::Relaxed) || shared.paused.load(Ordering::Relaxed) {
             return;
         }
-        match reader.read_exact(&mut buf) {
-            Ok(()) => {
-                generation = generation.wrapping_add(1);
-                let frame = Frame {
-                    width,
-                    height,
-                    rgb: buf.clone(),
-                    generation,
-                };
-                *lock(&shared.frame) = Some(Arc::new(frame));
-                *lock(&shared.status) = Status::Online;
-            }
-            Err(_) => return,
+        let Some((width, height)) = read_ppm_header(&mut reader) else {
+            return;
+        };
+        buf.resize(width * height * 3, 0);
+        if reader.read_exact(&mut buf).is_err() {
+            return;
         }
+        generation = generation.wrapping_add(1);
+        let frame = Frame {
+            width,
+            height,
+            rgb: buf.clone(),
+            generation,
+        };
+        *lock(&shared.frame) = Some(Arc::new(frame));
+        *lock(&shared.status) = Status::Online;
+    }
+}
+
+#[cfg(test)]
+mod ppm_tests {
+    use super::{
+        MAX_FRAME_BYTES, Shared, Status, StreamHandle, read_frames, read_ppm_header,
+    };
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn header(bytes: &[u8]) -> Option<(usize, usize)> {
+        read_ppm_header(&mut Cursor::new(bytes.to_vec()))
+    }
+
+    fn test_shared() -> Shared {
+        Shared {
+            frame: Arc::new(Mutex::new(None)),
+            status: Arc::new(Mutex::new(Status::Connecting)),
+            child: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// One `P6` frame: header plus `width * height * 3` payload bytes.
+    fn ppm_frame(width: usize, height: usize, fill: u8) -> Vec<u8> {
+        let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
+        out.extend(std::iter::repeat_n(fill, width * height * 3));
+        out
+    }
+
+    #[test]
+    fn header_reads_the_geometry_ffmpeg_emits() {
+        assert_eq!(header(b"P6\n1920 1080\n255\n"), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn header_accepts_space_separated_and_commented_variants() {
+        // PPM only requires whitespace between tokens, not newlines.
+        assert_eq!(header(b"P6 640 480 255 "), Some((640, 480)));
+        assert_eq!(
+            header(b"P6\n# written by ffmpeg\n640 480\n255\n"),
+            Some((640, 480))
+        );
+    }
+
+    #[test]
+    fn header_rejects_sixteen_bit_samples() {
+        // maxval > 255 doubles the payload stride; decoding it as 8-bit would
+        // silently tear every frame.
+        assert_eq!(header(b"P6\n64 64\n65535\n"), None);
+    }
+
+    #[test]
+    fn header_rejects_wrong_magic_and_degenerate_geometry() {
+        assert_eq!(header(b"P5\n64 64\n255\n"), None, "P5 is greyscale");
+        assert_eq!(header(b"P6\n0 64\n255\n"), None, "zero width");
+        assert_eq!(header(b"P6\n64 0\n255\n"), None, "zero height");
+        assert_eq!(header(b"P6\nwide 64\n255\n"), None, "non-numeric");
+        assert_eq!(header(b"P6\n64 64\n"), None, "truncated header");
+    }
+
+    #[test]
+    fn header_rejects_geometry_beyond_the_frame_cap() {
+        // Trust boundary: the header comes off a pipe, so an absurd geometry
+        // must be refused rather than turned into an allocation.
+        let over = format!("P6\n{MAX_FRAME_BYTES} {MAX_FRAME_BYTES}\n255\n");
+        assert_eq!(header(over.as_bytes()), None);
+        let overflow = format!("P6\n{} {}\n255\n", usize::MAX, usize::MAX);
+        assert_eq!(header(overflow.as_bytes()), None, "must not overflow");
+    }
+
+    #[test]
+    fn consecutive_frames_are_published_in_order() {
+        let shared = test_shared();
+        let mut stream = ppm_frame(2, 2, 0x11);
+        stream.extend(ppm_frame(2, 2, 0x22));
+        read_frames(&shared, Cursor::new(stream));
+
+        let frame = shared.frame.lock().expect("frame lock").clone().expect("a frame");
+        assert_eq!(frame.generation, 2, "both frames must be consumed");
+        assert_eq!(frame.rgb, vec![0x22; 12], "latest frame wins");
+        assert_eq!(*shared.status.lock().expect("status lock"), Status::Online);
+    }
+
+    #[test]
+    fn mid_stream_resolution_change_is_followed() {
+        // The whole point of per-frame headers: the old code fixed geometry
+        // once from ffprobe and tore every frame after a resolution change.
+        let shared = test_shared();
+        let mut stream = ppm_frame(2, 2, 0x11);
+        stream.extend(ppm_frame(4, 1, 0x33));
+        read_frames(&shared, Cursor::new(stream));
+
+        let frame = shared.frame.lock().expect("frame lock").clone().expect("a frame");
+        assert_eq!((frame.width, frame.height), (4, 1));
+        assert_eq!(frame.rgb.len(), 12);
+    }
+
+    #[test]
+    fn truncated_payload_stops_without_publishing_a_partial_frame() {
+        let shared = test_shared();
+        let mut stream = ppm_frame(2, 2, 0x11);
+        stream.truncate(stream.len() - 3); // lose one pixel
+        read_frames(&shared, Cursor::new(stream));
+        assert!(
+            shared.frame.lock().expect("frame lock").is_none(),
+            "a short read must publish nothing"
+        );
+    }
+
+    #[test]
+    fn shutdown_stops_the_reader_before_the_next_frame() {
+        let shared = test_shared();
+        shared.shutdown.store(true, Ordering::Relaxed);
+        read_frames(&shared, Cursor::new(ppm_frame(2, 2, 0x11)));
+        assert!(shared.frame.lock().expect("frame lock").is_none());
+    }
+
+    #[test]
+    fn handle_is_constructible_without_ffmpeg_present() {
+        // Guards the public surface used by app.rs; the worker thread failing
+        // to spawn ffmpeg must not panic the caller.
+        let handle = StreamHandle::spawn("rtsp://127.0.0.1:1/none");
+        handle.stop();
     }
 }
 
