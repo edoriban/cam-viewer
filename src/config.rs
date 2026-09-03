@@ -23,11 +23,32 @@ pub struct CameraConfig {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Opt-out default for [`Config::update_check`]: a user who never heard of
+/// this build has no other way to learn a fix shipped.
+fn default_update_check() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub badge_position: BadgePosition,
+    /// Whether to ask GitHub once per start whether a newer release exists.
+    /// Absent from an existing file means enabled; setting it to `false` stops
+    /// the app making any network request of its own.
+    #[serde(default = "default_update_check")]
+    pub update_check: bool,
     pub cameras: Vec<CameraConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            badge_position: BadgePosition::default(),
+            update_check: default_update_check(),
+            cameras: Vec::new(),
+        }
+    }
 }
 
 pub fn config_dir() -> Option<PathBuf> {
@@ -79,6 +100,7 @@ mod tests {
     fn sample() -> Config {
         Config {
             badge_position: BadgePosition::BottomRight,
+            update_check: true,
             cameras: vec![
                 CameraConfig {
                     name: "Front".to_owned(),
@@ -150,10 +172,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_toml_without_update_check_defaults_to_enabled() {
+        // Files written by 0.4.0 and earlier have no such key; they must keep
+        // working and must not silently opt out of hearing about fixes.
+        let raw = "[[cameras]]\nname = \"Front\"\nurl = \"rtsp://192.168.1.10/live\"\n";
+        let parsed: Config = toml::from_str(raw).expect("parse legacy config");
+        assert!(parsed.update_check, "absent key means enabled");
+    }
+
+    #[test]
+    fn update_check_false_survives_a_round_trip() {
+        // Opting out must actually stick, or the setting is a lie.
+        let cfg = Config {
+            update_check: false,
+            ..sample()
+        };
+        let raw = serialize(&cfg).expect("serialize");
+        let parsed: Config = toml::from_str(&raw).expect("parse");
+        assert!(!parsed.update_check);
+        assert_eq!(parsed, cfg);
+    }
+
+    #[test]
     fn saved_toml_emits_badge_position_before_cameras_table_and_round_trips() {
         for position in [BadgePosition::TopRight, BadgePosition::BottomRight] {
             let cfg = Config {
                 badge_position: position,
+                update_check: true,
                 cameras: sample().cameras,
             };
             let raw = serialize(&cfg).expect("serialize");

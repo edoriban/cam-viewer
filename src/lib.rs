@@ -3,3 +3,4 @@ pub mod config;
 pub mod discover;
 pub mod stream;
 pub mod theme;
+pub mod update;

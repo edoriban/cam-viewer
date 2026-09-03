@@ -7,6 +7,7 @@ use crate::discover::{
 };
 use crate::stream::{Status, StreamHandle};
 use crate::theme::{self, BtnVariant};
+use crate::update;
 use eframe::egui;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -41,6 +42,7 @@ struct SettingsRow {
 pub struct SettingsEditor {
     rows: Vec<SettingsRow>,
     badge_position: BadgePosition,
+    update_check: bool,
     error: Option<String>,
     original: Config,
     /// First CANCEL/Escape while dirty arms this instead of discarding
@@ -61,16 +63,19 @@ impl SettingsEditor {
                 })
                 .collect(),
             badge_position: config.badge_position,
+            update_check: config.update_check,
             error: None,
             original: config.clone(),
             confirm_discard: false,
         }
     }
 
-    /// SAVE is disabled while `collect()` + `badge_position` still matches
-    /// what the editor was opened with, so a no-op save can't restart streams.
+    /// SAVE is disabled while every editable field still matches what the
+    /// editor was opened with, so a no-op save can't restart streams.
     fn is_dirty(&self) -> bool {
-        self.badge_position != self.original.badge_position || self.collect() != self.original.cameras
+        self.badge_position != self.original.badge_position
+            || self.update_check != self.original.update_check
+            || self.collect() != self.original.cameras
     }
 
     fn add_row(&mut self) {
@@ -775,6 +780,14 @@ pub struct CamViewerApp {
     settings: SettingsEditor,
     discover: Option<DiscoverWizard>,
     badge_position: BadgePosition,
+    /// Persisted opt-out, carried so a settings save cannot silently re-enable
+    /// a check the user turned off.
+    update_check: bool,
+    /// Filled in by the background check; `None` until (and unless) a newer
+    /// release is found.
+    update_available: update::Shared,
+    /// Cleared for the session once the user dismisses the notice.
+    update_dismissed: bool,
 }
 
 impl CamViewerApp {
@@ -799,15 +812,71 @@ impl CamViewerApp {
             settings: SettingsEditor::from_config(config),
             discover: None,
             badge_position: config.badge_position,
+            update_check: config.update_check,
+            update_available: if config.update_check {
+                update::spawn_check()
+            } else {
+                update::Shared::default()
+            },
+            update_dismissed: false,
         }
     }
 
     fn open_settings(&mut self) {
         self.settings = SettingsEditor::from_config(&Config {
             badge_position: self.badge_position,
+            update_check: self.update_check,
             cameras: self.camera_configs(),
         });
         self.view = View::Settings;
+    }
+
+    /// Strip announcing a newer published release, shown only once the
+    /// background check has found one. It links to the release page and never
+    /// downloads anything itself; dismissing hides it for this session.
+    fn show_update_notice(&mut self, ctx: &egui::Context) {
+        if self.update_dismissed {
+            return;
+        }
+        let Some(available) = self
+            .update_available
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+        else {
+            return;
+        };
+
+        let mut dismiss = false;
+        egui::TopBottomPanel::top("update_notice")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PAPER)
+                    .inner_margin(egui::Margin::symmetric(16, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(theme::micro_label("UPDATE AVAILABLE", theme::INK));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "v{} \u{2192} v{}",
+                            env!("CARGO_PKG_VERSION"),
+                            available.version
+                        ))
+                        .font(theme::mono_font(12.0))
+                        .color(theme::LABEL_ON_PAPER),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::brutal_button(ui, "DISMISS", BtnVariant::Paper) {
+                            dismiss = true;
+                        }
+                        if theme::brutal_button(ui, "GET IT", BtnVariant::Ink) {
+                            ctx.open_url(egui::OpenUrl::new_tab(&available.url));
+                        }
+                    });
+                });
+            });
+        self.update_dismissed = dismiss;
     }
 
     fn camera_configs(&self) -> Vec<CameraConfig> {
@@ -834,17 +903,20 @@ impl CamViewerApp {
     fn commit_cameras(
         &mut self,
         badge_position: BadgePosition,
+        update_check: bool,
         cameras: Vec<CameraConfig>,
     ) -> Result<(), String> {
         config::save(
             &config::config_path(),
             &Config {
                 badge_position,
+                update_check,
                 cameras: cameras.clone(),
             },
         )
         .map_err(|err| format!("Failed to save config: {err:#}"))?;
         self.badge_position = badge_position;
+        self.update_check = update_check;
         self.apply_cameras(cameras);
         self.view = View::Grid;
         Ok(())
@@ -854,7 +926,8 @@ impl CamViewerApp {
         self.settings.error = None;
         let desired = self.settings.collect();
         let badge_position = self.settings.badge_position;
-        if let Err(err) = self.commit_cameras(badge_position, desired) {
+        let update_check = self.settings.update_check;
+        if let Err(err) = self.commit_cameras(badge_position, update_check, desired) {
             self.settings.error = Some(err);
         }
     }
@@ -902,7 +975,7 @@ impl CamViewerApp {
             return; // Verified no-op guard (REQ-13 empty-selection scenario).
         }
         let merged = merge_cameras(&existing, extra);
-        match self.commit_cameras(self.badge_position, merged) {
+        match self.commit_cameras(self.badge_position, self.update_check, merged) {
             Ok(()) => self.discover = None, // commit navigated to Grid (REQ-15).
             Err(err) => {
                 if let Some(wizard) = self.discover.as_mut() {
@@ -968,6 +1041,8 @@ impl eframe::App for CamViewerApp {
         if matches!(self.view, View::Solo(_)) && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.view = View::Grid;
         }
+
+        self.show_update_notice(ctx);
 
         let sidebar = show_sidebar(ctx, &self.view, &self.cameras);
         match sidebar {
@@ -1616,6 +1691,8 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
             }
 
             badge_position_row(ui, editor);
+            ui.add_space(14.0);
+            update_check_row(ui, editor);
 
             let mut delete = None;
             egui::ScrollArea::vertical()
@@ -1713,16 +1790,19 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
     action
 }
 
-/// Segmented two-option control for the grid-tile badge corner.
-fn badge_position_row(ui: &mut egui::Ui, editor: &mut SettingsEditor) {
-    ui.label(theme::micro_label("BADGE POSITION", theme::LABEL_ON_PAPER));
+/// Captioned segmented control: the selected option reads as Paper, the rest
+/// as Ink. Shared by every two-option setting so they stay visually identical.
+fn segmented_row<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    caption: &str,
+    current: &mut T,
+    options: &[(T, &str)],
+) {
+    ui.label(theme::micro_label(caption, theme::LABEL_ON_PAPER));
     ui.add_space(2.0);
     ui.horizontal(|ui| {
-        for (option, label) in [
-            (BadgePosition::TopRight, "TOP RIGHT"),
-            (BadgePosition::BottomRight, "BOTTOM RIGHT"),
-        ] {
-            let selected = editor.badge_position == option;
+        for (option, label) in options {
+            let selected = *current == *option;
             if theme::brutal_button(
                 ui,
                 label,
@@ -1732,11 +1812,42 @@ fn badge_position_row(ui: &mut egui::Ui, editor: &mut SettingsEditor) {
                     BtnVariant::Ink
                 },
             ) {
-                editor.badge_position = option;
+                *current = *option;
             }
             ui.add_space(6.0);
         }
     });
+}
+
+/// Segmented two-option control for the grid-tile badge corner.
+fn badge_position_row(ui: &mut egui::Ui, editor: &mut SettingsEditor) {
+    segmented_row(
+        ui,
+        "BADGE POSITION",
+        &mut editor.badge_position,
+        &[
+            (BadgePosition::TopRight, "TOP RIGHT"),
+            (BadgePosition::BottomRight, "BOTTOM RIGHT"),
+        ],
+    );
+}
+
+/// Opt-out for the once-per-start release check. Worth surfacing because this
+/// app runs on surveillance networks where an outbound request is a decision
+/// the operator should own, not something buried in a TOML file.
+fn update_check_row(ui: &mut egui::Ui, editor: &mut SettingsEditor) {
+    segmented_row(
+        ui,
+        "CHECK FOR UPDATES ON START",
+        &mut editor.update_check,
+        &[(true, "ON"), (false, "OFF")],
+    );
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("Asks GitHub once whether a newer release exists. Never downloads.")
+            .font(theme::mono_font(11.0))
+            .color(theme::ASH),
+    );
 }
 
 fn settings_row(
