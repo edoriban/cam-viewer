@@ -712,6 +712,19 @@ impl DiscoverWizard {
     }
 
     fn show_scanning(&mut self, ui: &mut egui::Ui, action: &mut DiscoverAction) {
+        footer_panel(ui, "discover_scanning_footer", |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.cancelling {
+                    ui.label(theme::micro_label(
+                        "CANCELLING\u{2026}",
+                        theme::LABEL_ON_PAPER,
+                    ));
+                } else if theme::brutal_button(ui, "CANCEL", BtnVariant::Danger) {
+                    *action = DiscoverAction::Cancel;
+                }
+            });
+        });
+
         ui.add_space(4.0);
         match &self.latest {
             Some(snap) => ui.label(theme::micro_label(
@@ -734,19 +747,6 @@ impl DiscoverWizard {
         self.maybe_ws_hint(ui);
         ui.add_space(6.0);
 
-        footer_panel(ui, "discover_scanning_footer", |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.cancelling {
-                    ui.label(theme::micro_label(
-                        "CANCELLING\u{2026}",
-                        theme::LABEL_ON_PAPER,
-                    ));
-                } else if theme::brutal_button(ui, "CANCEL", BtnVariant::Danger) {
-                    *action = DiscoverAction::Cancel;
-                }
-            });
-        });
-
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -755,24 +755,11 @@ impl DiscoverWizard {
     }
 
     fn show_results(&mut self, ui: &mut egui::Ui, action: &mut DiscoverAction) {
-        ui.add_space(4.0);
         let selected = self
             .rows
             .iter()
             .filter(|row| row.checked && row.addable())
             .count();
-        ui.label(theme::micro_label(
-            format!(
-                "{} DEVICE(S) FOUND \u{b7} {} SELECTED",
-                self.rows.len(),
-                selected
-            ),
-            theme::LABEL_ON_PAPER,
-        ));
-        auth_legend(ui);
-        self.maybe_ws_hint(ui);
-        ui.add_space(6.0);
-
         footer_panel(ui, "discover_results_footer", |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Disabled (unclickable) when nothing addable is ticked (REQ-13).
@@ -798,6 +785,19 @@ impl DiscoverWizard {
             }
             });
         });
+
+        ui.add_space(4.0);
+        ui.label(theme::micro_label(
+            format!(
+                "{} DEVICE(S) FOUND \u{b7} {} SELECTED",
+                self.rows.len(),
+                selected
+            ),
+            theme::LABEL_ON_PAPER,
+        ));
+        auth_legend(ui);
+        self.maybe_ws_hint(ui);
+        ui.add_space(6.0);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -841,6 +841,11 @@ impl DiscoverWizard {
 }
 
 /// Bottom-anchored action bar.
+///
+/// MUST be called before anything else is drawn into `ui`. A panel reserves
+/// space out of the Ui's remaining rect, so declaring it after the page
+/// content has already advanced the cursor mis-measures what is left and
+/// starves the scroll area below it.
 ///
 /// Uses a real panel so egui reserves the footer's *measured* height and the
 /// scroll area above receives exactly what is left. The previous approach
@@ -1987,6 +1992,16 @@ fn instrument_cell(
 // Settings view
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// (content height, viewport height) from the last Settings frame.
+    ///
+    /// Exists so a test can assert that an ordinary camera list fits without
+    /// scrolling, instead of that being something only a human notices after
+    /// a release. Written every frame; read only by tests.
+    static LAST_SETTINGS_FIT: std::cell::Cell<Option<(f32, f32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAction {
     let mut action = SettingsAction::None;
     // Applied before anything draws, so is_dirty() and the row list agree for
@@ -2000,29 +2015,6 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
         )
         .show(ctx, |ui| {
             paper_visuals(ui);
-
-            ui.label(
-                egui::RichText::new("SETTINGS")
-                    .font(theme::display_font(30.0))
-                    .color(theme::PAPER),
-            );
-            ui.label(theme::micro_label(
-                format!(
-                    "CAMERAS.TOML \u{b7} EDITED IN APP \u{b7} {} ENTRIES",
-                    editor.rows.len()
-                ),
-                theme::LABEL_ON_PAPER,
-            ));
-            ui.add_space(8.0);
-
-            if let Some(err) = &editor.error {
-                error_line(ui, err);
-                ui.add_space(4.0);
-            }
-
-            badge_position_row(ui, editor);
-            ui.add_space(14.0);
-            update_check_row(ui, editor);
 
             let dirty = editor.is_dirty();
             footer_panel(ui, "settings_footer", |ui| {
@@ -2065,10 +2057,39 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
                 });
             });
 
+
+            ui.label(
+                egui::RichText::new("SETTINGS")
+                    .font(theme::display_font(30.0))
+                    .color(theme::PAPER),
+            );
+            ui.label(theme::micro_label(
+                format!(
+                    "CAMERAS.TOML \u{b7} EDITED IN APP \u{b7} {} ENTRIES",
+                    editor.rows.len()
+                ),
+                theme::LABEL_ON_PAPER,
+            ));
+            ui.add_space(8.0);
+
+            if let Some(err) = &editor.error {
+                error_line(ui, err);
+                ui.add_space(4.0);
+            }
+
+            // Every setting scrolls together. Keeping these two controls
+            // outside the scroll area cost it ~130pt of fixed height, which
+            // was enough to make a two-camera list scroll on a 720p window
+            // even though it comfortably fits the page.
             let mut delete = None;
-            egui::ScrollArea::vertical()
+            let scrolled = egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    badge_position_row(ui, editor);
+                    ui.add_space(14.0);
+                    update_check_row(ui, editor);
+                    ui.add_space(14.0);
+
                     for (i, row) in editor.rows.iter_mut().enumerate() {
                         settings_row(ui, i, row, &mut delete);
                         ui.add_space(10.0);
@@ -2113,6 +2134,9 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
                 });
 
             editor.pending_delete = delete;
+            LAST_SETTINGS_FIT.with(|cell| {
+                cell.set(Some((scrolled.content_size.y, scrolled.inner_rect.height())));
+            });
         });
     action
 }
@@ -2931,5 +2955,82 @@ mod tests {
             // Navigation itself stays untouched; only the wizard ends.
             assert!(!matches!(app.view, View::Discover));
         }
+    }
+}
+
+#[cfg(test)]
+mod settings_layout_tests {
+    use super::*;
+
+    /// Renders Settings headlessly and returns (content height, viewport
+    /// height) for the scroll area.
+    fn render(cameras: usize, window_height: f32) -> (f32, f32) {
+        let cfg = Config {
+            badge_position: BadgePosition::BottomRight,
+            update_check: true,
+            cameras: (0..cameras)
+                .map(|i| CameraConfig {
+                    name: format!("Cam {i}"),
+                    url: format!("rtsp://192.168.100.{}:554/live/ch0", 10 + i),
+                })
+                .collect(),
+        };
+        let mut editor = SettingsEditor::from_config(&cfg);
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1366.0, window_height),
+            )),
+            ..Default::default()
+        };
+        // Three frames: egui settles panel sizes over the first two.
+        for _ in 0..3 {
+            let _ = ctx.run(input.clone(), |ctx| {
+                let _ = show_settings(ctx, &mut editor);
+            });
+        }
+        LAST_SETTINGS_FIT
+            .with(|cell| cell.get())
+            .expect("Settings rendered at least once")
+    }
+
+    #[test]
+    fn a_short_camera_list_needs_no_scrolling() {
+        // The regression this guards: BADGE POSITION and CHECK FOR UPDATES
+        // used to sit outside the scroll area, costing it ~160pt of fixed
+        // height and making a two-camera list scroll on an ordinary window.
+        for height in [687.0, 720.0, 800.0] {
+            let (content, viewport) = render(2, height);
+            assert!(
+                content <= viewport,
+                "2 cameras must fit at window height {height}: \
+                 content {content}pt vs viewport {viewport}pt"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_camera_list_still_scrolls() {
+        // The complement: the scroll area must still do its job, or a long
+        // list would simply be unreachable.
+        let (content, viewport) = render(8, 687.0);
+        assert!(
+            content > viewport,
+            "8 cameras should overflow: content {content}pt vs viewport {viewport}pt"
+        );
+    }
+
+    #[test]
+    fn every_setting_scrolls_with_the_camera_list() {
+        // If the controls were moved back out of the scroll area, the content
+        // measured here would shrink by their height.
+        let (with_controls, _) = render(0, 687.0);
+        assert!(
+            with_controls > 150.0,
+            "the settings controls belong inside the scrolled content, \
+             measured only {with_controls}pt"
+        );
     }
 }
