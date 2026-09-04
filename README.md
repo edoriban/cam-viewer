@@ -51,6 +51,34 @@ cam-viewer --version
 which -a cam-viewer   # more than one line means the first one wins
 ```
 
+#### Removing an older install
+
+The installer never deletes anything it did not write: a binary elsewhere may
+be package-managed or deliberate. It names what it finds instead, so a stale
+install is removed with the paths it printed:
+
+```
+WARNING: other cam-viewer copies are on your PATH:
+  /home/you/opt/cam-viewer  (cam-viewer 0.3.0)
+
+WARNING: other desktop entries launch cam-viewer:
+  /home/you/.local/share/applications/camviewer-old.desktop
+      runs: /home/you/opt/cam-viewer
+```
+
+```sh
+rm /home/you/opt/cam-viewer
+rm /home/you/.local/share/applications/camviewer-old.desktop
+# outside your home, e.g. /usr/local/bin/cam-viewer, prefix with sudo
+```
+
+Re-run the installer afterwards: no `WARNING` means nothing old is left.
+
+Both matter. A binary earlier in `PATH` wins on the command line, and a
+desktop entry keeps opening whatever path it names regardless of `PATH` — so
+a leftover launcher can go on starting an old build from the menu even after
+the stale binary stops winning the shell.
+
 ### Windows
 
 Download the `.zip` release asset and extract it. `cam-viewer --version` prints
