@@ -135,6 +135,9 @@ struct DiscoverRow {
     relink_options: Vec<String>,
     /// Chosen camera to re-point at this address instead of adding a new one.
     relink_to: Option<String>,
+    /// Camera currently holding this address, which a relink would displace
+    /// into the address being vacated. Names the other half of a swap.
+    relink_swaps_with: Option<String>,
 }
 
 impl DiscoverRow {
@@ -147,6 +150,7 @@ impl DiscoverRow {
             manual_path: String::new(),
             relink_options: Vec::new(),
             relink_to: None,
+            relink_swaps_with: None,
         }
     }
 
@@ -170,11 +174,15 @@ impl DiscoverRow {
         ))
     }
 
-    /// Enabled-checkbox semantics: a row is addable once it can name a URL and
-    /// is not already configured. For `PathUnknown` that means the user has
-    /// typed a usable path.
+    /// Enabled-checkbox semantics: a row is actionable once it can name a URL
+    /// and either is not already configured, or is being relinked. For
+    /// `PathUnknown` that means the user has typed a usable path.
+    ///
+    /// An already-configured address stays actionable when a relink is chosen:
+    /// pointing a camera at an address another camera already holds is exactly
+    /// how a swapped pair of names gets corrected.
     fn addable(&self) -> bool {
-        self.effective_url().is_some() && !self.exact_duplicate
+        self.effective_url().is_some() && (!self.exact_duplicate || self.relink_to.is_some())
     }
 
     fn key(&self) -> String {
@@ -292,10 +300,20 @@ fn apply_relinks(existing: &mut [CameraConfig], rows: &[DiscoverRow]) -> usize {
         let (Some(name), Some(url)) = (row.relink_to.as_ref(), row.effective_url()) else {
             continue;
         };
-        if let Some(cam) = existing.iter_mut().find(|cam| &cam.name == name) {
-            cam.url = url;
-            moved += 1;
+        let Some(target) = existing.iter().position(|cam| &cam.name == name) else {
+            continue;
+        };
+        let vacated = std::mem::replace(&mut existing[target].url, url.clone());
+        // If another camera already held this address, the two names were
+        // swapped: hand it the address this one just left, so the pair trades
+        // places instead of both pointing at the same camera.
+        if let Some(other) = existing
+            .iter()
+            .position(|cam| &cam.name != name && same_camera_url(&cam.url, &url))
+        {
+            existing[other].url = vacated;
         }
+        moved += 1;
     }
     moved
 }
@@ -390,6 +408,13 @@ fn reconcile_rows(
         if was_empty && row.relink_to.is_none() && row.relink_options.len() == 1 {
             row.relink_to = row.relink_options.first().cloned();
         }
+        row.relink_swaps_with = match (&row.relink_to, row.effective_url()) {
+            (Some(chosen), Some(url)) => existing
+                .iter()
+                .find(|cam| &cam.name != chosen && same_camera_url(&cam.url, &url))
+                .map(|cam| cam.name.clone()),
+            _ => None,
+        };
     }
 }
 
@@ -933,10 +958,13 @@ fn discover_row_card(ui: &mut egui::Ui, row: &mut DiscoverRow, preview: &mut Opt
                         });
                 });
                 if let Some(name) = &row.relink_to {
-                    ui.label(theme::micro_label(
-                        format!("{name} keeps its name and moves to this address"),
-                        theme::LABEL_ON_PAPER,
-                    ));
+                    let note = match &row.relink_swaps_with {
+                        Some(other) => format!(
+                            "{name} moves here and {other} takes the address {name} leaves \u{2014} they swap"
+                        ),
+                        None => format!("{name} keeps its name and moves to this address"),
+                    };
+                    ui.label(theme::micro_label(note, theme::LABEL_ON_PAPER));
                 }
             }
             // Outside the fade above on purpose: this row is disabled precisely
@@ -962,7 +990,10 @@ fn discover_row_card(ui: &mut egui::Ui, row: &mut DiscoverRow, preview: &mut Opt
             }
             // Drawn at full contrast, outside the fade above: this is the
             // reason the row is disabled, so it must stay legible.
-            if row.exact_duplicate {
+            if row.relink_to.is_some() {
+                // Saying "already configured" next to a chosen relink reads as
+                // "nothing will happen", which is the opposite of the truth.
+            } else if row.exact_duplicate {
                 ui.label(theme::micro_label("ALREADY CONFIGURED", theme::INK));
             } else if row.duplicate {
                 ui.label(theme::micro_label("SAME HOST ALREADY CONFIGURED", theme::INK));
@@ -2329,6 +2360,87 @@ mod tests {
             "the other camera is untouched"
         );
         assert_eq!(existing.len(), 2, "relink replaces, never appends");
+    }
+
+    #[test]
+    fn relinking_onto_an_address_another_camera_holds_swaps_them() {
+        // The correction path for a mis-assigned pair: Lateral was pointed at
+        // the camera that is really the Cochera. Relinking Cochera here must
+        // trade addresses, not leave both cameras on the same one.
+        let mut existing = vec![
+            camera("Lateral", "rtsp://192.168.100.11:554/live/ch0"),
+            camera("Cochera", "rtsp://192.168.100.6:554/live/ch0"),
+        ];
+        let mut row = DiscoverRow::new(found(
+            [192, 168, 100, 11],
+            "rtsp://192.168.100.11:554/live/ch0",
+        ));
+        row.checked = true;
+        row.exact_duplicate = true; // the address is already configured
+        row.relink_to = Some("Cochera".to_owned());
+
+        assert_eq!(apply_relinks(&mut existing, &[row]), 1);
+        assert_eq!(existing[1].url, "rtsp://192.168.100.11:554/live/ch0");
+        assert_eq!(
+            existing[0].url, "rtsp://192.168.100.6:554/live/ch0",
+            "Lateral takes the address Cochera vacated"
+        );
+        assert_eq!(existing[0].name, "Lateral");
+        assert_eq!(existing[1].name, "Cochera");
+    }
+
+    #[test]
+    fn an_already_configured_address_stays_actionable_when_relinked() {
+        // The bug this fixes: the checkbox was dead on exactly the row needed
+        // to correct a swap, because "already configured" was treated as if
+        // the only possible action were adding a new camera.
+        let mut row = DiscoverRow::new(found(
+            [192, 168, 100, 11],
+            "rtsp://192.168.100.11:554/live/ch0",
+        ));
+        row.exact_duplicate = true;
+        assert!(!row.addable(), "adding a configured address is still a no-op");
+
+        row.relink_to = Some("Cochera".to_owned());
+        assert!(row.addable(), "relinking it is a real action");
+    }
+
+    #[test]
+    fn a_relink_onto_a_free_address_displaces_nobody() {
+        let mut existing = vec![
+            camera("Lateral", "rtsp://192.168.100.5:554/live/ch0"),
+            camera("Cochera", "rtsp://192.168.100.6:554/live/ch0"),
+        ];
+        let mut row = DiscoverRow::new(found(
+            [192, 168, 100, 22],
+            "rtsp://192.168.100.22:554/live/ch0",
+        ));
+        row.checked = true;
+        row.relink_to = Some("Lateral".to_owned());
+
+        apply_relinks(&mut existing, &[row]);
+        assert_eq!(existing[0].url, "rtsp://192.168.100.22:554/live/ch0");
+        assert_eq!(
+            existing[1].url, "rtsp://192.168.100.6:554/live/ch0",
+            "the untouched camera keeps its address"
+        );
+    }
+
+    #[test]
+    fn the_swap_partner_is_reported_for_the_row_note() {
+        let existing = vec![
+            camera("Lateral", "rtsp://192.168.100.11:554/live/ch0"),
+            camera("Cochera", "rtsp://192.168.100.6:554/live/ch0"),
+        ];
+        let results = vec![found(
+            [192, 168, 100, 11],
+            "rtsp://192.168.100.11:554/live/ch0",
+        )];
+        let mut rows = Vec::new();
+        reconcile_rows(&mut rows, &results, &existing);
+        rows[0].relink_to = Some("Cochera".to_owned());
+        reconcile_rows(&mut rows, &results, &existing);
+        assert_eq!(rows[0].relink_swaps_with.as_deref(), Some("Lateral"));
     }
 
     #[test]
