@@ -23,22 +23,50 @@ cam-viewer shows live video from IP cameras that expose an RTSP stream. Each cam
   ```
 
   Frames are read from the pipe into shared state (`Arc<Mutex<...>>`) and uploaded as GPU textures by the UI.
-- When the window is unfocused for a while, all streams are paused: ffmpeg children are stopped and only probed periodically until focus returns.
 - Crashed or exited ffmpeg processes are restarted automatically after a short delay.
 
-## Install / build
+## Install
 
-Requirements:
+`ffmpeg` must be available in `PATH` at runtime.
 
-- Rust (stable, edition 2024)
-- `ffmpeg` (and optionally `ffprobe`) available in `PATH` at runtime
+### Linux
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/edoriban/cam-viewer/main/install.sh | sh
+```
+
+Installs the latest release to `~/.local/bin/cam-viewer` (no root needed) and
+writes a desktop entry pointing at that exact path. Re-run it to update.
+
+Prefer this over copying the binary by hand. Both put a file somewhere, but
+only the script points the desktop entry at the path it just wrote and warns
+about other `cam-viewer` copies earlier in your `PATH` — a stale copy winning
+the `PATH`, or a launcher pinned to an old location, is the usual reason an
+"updated" install keeps behaving like the version it replaced.
+
+To check which build is actually running:
+
+```sh
+cam-viewer --version
+which -a cam-viewer   # more than one line means the first one wins
+```
+
+### Windows
+
+Download the `.zip` release asset and extract it. `cam-viewer --version` prints
+nothing there: the GUI subsystem gives the process no console.
+
+### Building from source
+
+Requires Rust (stable, edition 2024).
 
 ```sh
 cargo build --release
 ./target/release/cam-viewer
 ```
 
-Linux is supported (X11/Wayland via eframe). Windows builds are provided as release assets.
+Linux is supported (X11/Wayland via eframe). Windows builds are cross-compiled
+with `cargo xwin build --release --target x86_64-pc-windows-msvc`.
 
 ## Configuration
 
