@@ -129,6 +129,12 @@ struct DiscoverRow {
     /// Path typed by the user for a `PathUnknown` host. Preserved across
     /// frames by `reconcile_rows`, which only refreshes `result`.
     manual_path: String,
+    /// Configured cameras this host could be: same stream, different address,
+    /// and their old address answered nothing this scan. Recomputed each
+    /// frame from the live results.
+    relink_options: Vec<String>,
+    /// Chosen camera to re-point at this address instead of adding a new one.
+    relink_to: Option<String>,
 }
 
 impl DiscoverRow {
@@ -139,6 +145,8 @@ impl DiscoverRow {
             duplicate: false,
             exact_duplicate: false,
             manual_path: String::new(),
+            relink_options: Vec::new(),
+            relink_to: None,
         }
     }
 
@@ -240,6 +248,58 @@ fn merge_cameras(existing: &[CameraConfig], extra: Vec<CameraConfig>) -> Vec<Cam
     merged
 }
 
+/// Configured cameras that this discovery result plausibly *is*: same port
+/// and path, a different address, and whose own address answered nothing in
+/// this scan.
+///
+/// Deliberately returns every match rather than picking one. Two identical
+/// cameras that both changed address produce two candidates each, and
+/// guessing there would silently swap which physical camera is called what.
+fn relink_candidates(
+    result: &DiscoveryResult,
+    existing: &[CameraConfig],
+    discovered_ips: &[Ipv4Addr],
+) -> Vec<String> {
+    let Some(url) = &result.url else {
+        return Vec::new();
+    };
+    let Some((_, port, path)) = url_identity(url) else {
+        return Vec::new();
+    };
+    existing
+        .iter()
+        .filter(|cam| {
+            let Some((host, cam_port, cam_path)) = url_identity(&cam.url) else {
+                return false;
+            };
+            if cam_port != port || cam_path != path {
+                return false;
+            }
+            let Ok(cam_ip) = host.parse::<Ipv4Addr>() else {
+                return false; // a hostname-based URL is not an address move
+            };
+            cam_ip != result.ip && !discovered_ips.contains(&cam_ip)
+        })
+        .map(|cam| cam.name.clone())
+        .collect()
+}
+
+/// Re-points chosen cameras at their rediscovered address, keeping name and
+/// position. Returns how many were moved.
+fn apply_relinks(existing: &mut [CameraConfig], rows: &[DiscoverRow]) -> usize {
+    let mut moved = 0;
+    for row in rows.iter().filter(|row| row.checked) {
+        let (Some(name), Some(url)) = (row.relink_to.as_ref(), row.effective_url()) else {
+            continue;
+        };
+        if let Some(cam) = existing.iter_mut().find(|cam| &cam.name == name) {
+            cam.url = url;
+            moved += 1;
+        }
+    }
+    moved
+}
+
 /// A hand-typed RTSP path made usable: trimmed and forced to a single leading
 /// slash. `None` for input that names no path, including a bare `/`, which the
 /// vendor table already probed and which therefore cannot be the answer here.
@@ -267,7 +327,7 @@ fn discovered_name(vendor: Option<&str>, ip: Ipv4Addr, fallback: usize) -> Strin
 /// after the existing cameras, matching the Settings `Cam N` convention.
 fn selected_cameras(rows: &[DiscoverRow], existing_count: usize) -> Vec<CameraConfig> {
     rows.iter()
-        .filter(|row| row.checked && row.addable())
+        .filter(|row| row.checked && row.addable() && row.relink_to.is_none())
         .enumerate()
         .map(|(i, row)| CameraConfig {
             name: discovered_name(
@@ -290,6 +350,7 @@ fn reconcile_rows(
     results: &[DiscoveryResult],
     existing: &[CameraConfig],
 ) {
+    let discovered_ips: Vec<Ipv4Addr> = results.iter().map(|result| result.ip).collect();
     for result in results {
         let key = result_key(result);
         match rows.iter_mut().find(|row| row.key() == key) {
@@ -312,6 +373,24 @@ fn reconcile_rows(
         }
     }
     rows.retain(|row| results.iter().any(|result| result_key(result) == row.key()));
+
+    for row in rows.iter_mut() {
+        let was_empty = row.relink_options.is_empty();
+        row.relink_options = relink_candidates(&row.result, existing, &discovered_ips);
+        // A choice that no longer matches anything must not silently persist.
+        if row
+            .relink_to
+            .as_ref()
+            .is_some_and(|name| !row.relink_options.contains(name))
+        {
+            row.relink_to = None;
+        }
+        // One unambiguous candidate is offered pre-selected; more than one is
+        // left to the user, because picking would risk swapping identities.
+        if was_empty && row.relink_to.is_none() && row.relink_options.len() == 1 {
+            row.relink_to = row.relink_options.first().cloned();
+        }
+    }
 }
 
 /// Wizard state machine (REQ-13): `handle.is_some()` is Scanning, non-empty
@@ -750,6 +829,36 @@ fn discover_row_card(ui: &mut egui::Ui, row: &mut DiscoverRow) {
                     });
                 });
             });
+            // Full contrast, outside the fade: this is what turns a
+            // "new camera" row into "the camera you already had, moved".
+            if !row.relink_options.is_empty() {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(theme::micro_label("LOOKS MOVED", theme::INK));
+                    let selected = match &row.relink_to {
+                        Some(name) => format!("RELINK \u{2192} {name}"),
+                        None => String::from("ADD AS NEW"),
+                    };
+                    egui::ComboBox::from_id_salt(("relink", row.result.ip))
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut row.relink_to, None, "ADD AS NEW");
+                            for name in &row.relink_options {
+                                ui.selectable_value(
+                                    &mut row.relink_to,
+                                    Some(name.clone()),
+                                    format!("RELINK \u{2192} {name}"),
+                                );
+                            }
+                        });
+                });
+                if let Some(name) = &row.relink_to {
+                    ui.label(theme::micro_label(
+                        format!("{name} keeps its name and moves to this address"),
+                        theme::LABEL_ON_PAPER,
+                    ));
+                }
+            }
             // Outside the fade above on purpose: this row is disabled precisely
             // because no path is known, so the control that fixes that has to
             // stay usable.
@@ -1027,13 +1136,19 @@ impl CamViewerApp {
     /// path. Save failure keeps the wizard in Results with the selection
     /// intact and no navigation.
     fn add_selected(&mut self) {
-        let existing = self.camera_configs();
-        let extra = self
-            .discover
-            .as_ref()
-            .map(|wizard| selected_cameras(&wizard.rows, existing.len()))
-            .unwrap_or_default();
-        if extra.is_empty() {
+        let mut existing = self.camera_configs();
+        let (extra, relinked) = match self.discover.as_ref() {
+            Some(wizard) => {
+                // Relinks rewrite entries in place, so they run before the
+                // append: a moved camera keeps its name instead of being
+                // duplicated under a generated one.
+                let relinked = apply_relinks(&mut existing, &wizard.rows);
+                let extra = selected_cameras(&wizard.rows, existing.len());
+                (extra, relinked)
+            }
+            None => (Vec::new(), 0),
+        };
+        if extra.is_empty() && relinked == 0 {
             return; // Verified no-op guard (REQ-13 empty-selection scenario).
         }
         let merged = merge_cameras(&existing, extra);
@@ -2031,6 +2146,126 @@ mod tests {
             resolution: None,
             auth,
         }
+    }
+
+    fn found(ip: [u8; 4], url: &str) -> DiscoveryResult {
+        DiscoveryResult {
+            ip: Ipv4Addr::from(ip),
+            port: 554,
+            url: Some(url.to_owned()),
+            vendor: Some("Generic".to_owned()),
+            resolution: Some((1920, 1080)),
+            auth: RowStatus::Open,
+        }
+    }
+
+    #[test]
+    fn a_camera_rediscovered_at_a_new_address_is_offered_as_a_relink() {
+        let existing = vec![camera("Lateral", "rtsp://192.168.100.5:554/live/ch0")];
+        let result = found([192, 168, 100, 22], "rtsp://192.168.100.22:554/live/ch0");
+        let candidates = relink_candidates(&result, &existing, &[result.ip]);
+        assert_eq!(candidates, vec!["Lateral".to_owned()]);
+    }
+
+    #[test]
+    fn a_camera_still_answering_at_its_own_address_is_not_a_move() {
+        // The old address responded in this very scan, so nothing moved and
+        // offering to relink would corrupt a working configuration.
+        let existing = vec![camera("Lateral", "rtsp://192.168.100.5:554/live/ch0")];
+        let result = found([192, 168, 100, 22], "rtsp://192.168.100.22:554/live/ch0");
+        let both_alive = [Ipv4Addr::new(192, 168, 100, 5), result.ip];
+        assert!(relink_candidates(&result, &existing, &both_alive).is_empty());
+    }
+
+    #[test]
+    fn a_different_stream_path_is_never_a_move() {
+        let existing = vec![camera("Lateral", "rtsp://192.168.100.5:554/live/ch0")];
+        let result = found([192, 168, 100, 22], "rtsp://192.168.100.22:554/other/path");
+        assert!(relink_candidates(&result, &existing, &[result.ip]).is_empty());
+    }
+
+    #[test]
+    fn two_identical_cameras_that_both_moved_stay_ambiguous() {
+        // The real case: both cameras use /live/ch0 and both changed address.
+        // Each result matches both configured cameras, and picking one would
+        // silently swap which physical camera is called what.
+        let existing = vec![
+            camera("Lateral", "rtsp://192.168.100.5:554/live/ch0"),
+            camera("Cochera", "rtsp://192.168.100.6:554/live/ch0"),
+        ];
+        let result = found([192, 168, 100, 22], "rtsp://192.168.100.22:554/live/ch0");
+        let candidates = relink_candidates(&result, &existing, &[result.ip]);
+        assert_eq!(
+            candidates,
+            vec!["Lateral".to_owned(), "Cochera".to_owned()],
+            "both must be offered so the user decides"
+        );
+    }
+
+    #[test]
+    fn relink_moves_the_url_and_keeps_the_name() {
+        let mut existing = vec![
+            camera("Lateral", "rtsp://192.168.100.5:554/live/ch0"),
+            camera("Cochera", "rtsp://192.168.100.6:554/live/ch0"),
+        ];
+        let mut row = DiscoverRow::new(found(
+            [192, 168, 100, 22],
+            "rtsp://192.168.100.22:554/live/ch0",
+        ));
+        row.checked = true;
+        row.relink_to = Some("Lateral".to_owned());
+
+        assert_eq!(apply_relinks(&mut existing, &[row]), 1);
+        assert_eq!(existing[0].name, "Lateral", "name survives the move");
+        assert_eq!(existing[0].url, "rtsp://192.168.100.22:554/live/ch0");
+        assert_eq!(
+            existing[1].url, "rtsp://192.168.100.6:554/live/ch0",
+            "the other camera is untouched"
+        );
+        assert_eq!(existing.len(), 2, "relink replaces, never appends");
+    }
+
+    #[test]
+    fn an_unchecked_relink_changes_nothing() {
+        let mut existing = vec![camera("Lateral", "rtsp://192.168.100.5:554/live/ch0")];
+        let mut row = DiscoverRow::new(found(
+            [192, 168, 100, 22],
+            "rtsp://192.168.100.22:554/live/ch0",
+        ));
+        row.relink_to = Some("Lateral".to_owned());
+        row.checked = false;
+        assert_eq!(apply_relinks(&mut existing, &[row]), 0);
+        assert_eq!(existing[0].url, "rtsp://192.168.100.5:554/live/ch0");
+    }
+
+    #[test]
+    fn a_relinked_row_is_not_also_appended_as_a_new_camera() {
+        // Otherwise the move would leave both a moved camera and a duplicate.
+        let mut row = DiscoverRow::new(found(
+            [192, 168, 100, 22],
+            "rtsp://192.168.100.22:554/live/ch0",
+        ));
+        row.checked = true;
+        row.relink_to = Some("Lateral".to_owned());
+        assert!(selected_cameras(&[row], 0).is_empty());
+    }
+
+    #[test]
+    fn one_unambiguous_candidate_is_preselected_but_two_are_not() {
+        let one = vec![camera("Lateral", "rtsp://192.168.100.5:554/live/ch0")];
+        let results = vec![found([192, 168, 100, 22], "rtsp://192.168.100.22:554/live/ch0")];
+        let mut rows = Vec::new();
+        reconcile_rows(&mut rows, &results, &one);
+        assert_eq!(rows[0].relink_to.as_deref(), Some("Lateral"));
+
+        let two = vec![
+            camera("Lateral", "rtsp://192.168.100.5:554/live/ch0"),
+            camera("Cochera", "rtsp://192.168.100.6:554/live/ch0"),
+        ];
+        let mut rows = Vec::new();
+        reconcile_rows(&mut rows, &results, &two);
+        assert_eq!(rows[0].relink_to, None, "ambiguous stays unselected");
+        assert_eq!(rows[0].relink_options.len(), 2);
     }
 
     fn unknown_path_row(ip: [u8; 4], port: u16) -> DiscoverRow {
