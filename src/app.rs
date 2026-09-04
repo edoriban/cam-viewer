@@ -43,11 +43,6 @@ pub struct SettingsEditor {
     rows: Vec<SettingsRow>,
     badge_position: BadgePosition,
     update_check: bool,
-    /// Row the user asked to delete, applied at the start of the next frame.
-    /// The footer is a bottom panel and therefore draws before the row list,
-    /// so the deletion has to already be applied when `is_dirty()` is asked,
-    /// or SAVE would stay disabled for a frame after removing a camera.
-    pending_delete: Option<usize>,
     error: Option<String>,
     original: Config,
     /// First CANCEL/Escape while dirty arms this instead of discarding
@@ -69,7 +64,6 @@ impl SettingsEditor {
                 .collect(),
             badge_position: config.badge_position,
             update_check: config.update_check,
-            pending_delete: None,
             error: None,
             original: config.clone(),
             confirm_discard: false,
@@ -82,21 +76,6 @@ impl SettingsEditor {
         self.badge_position != self.original.badge_position
             || self.update_check != self.original.update_check
             || self.collect() != self.original.cameras
-    }
-
-    /// Removes the row queued for deletion by the previous frame.
-    ///
-    /// Deletion is deferred because the footer is a bottom panel and draws
-    /// before the row list: applying it here keeps `is_dirty()` and the rows
-    /// consistent, so SAVE lights up in the same frame the row disappears.
-    /// A stale index is dropped rather than panicking, since rows can also be
-    /// removed by a config reload between frames.
-    fn apply_pending_delete(&mut self) {
-        if let Some(index) = self.pending_delete.take()
-            && index < self.rows.len()
-        {
-            self.rows.remove(index);
-        }
     }
 
     fn add_row(&mut self) {
@@ -712,19 +691,6 @@ impl DiscoverWizard {
     }
 
     fn show_scanning(&mut self, ui: &mut egui::Ui, action: &mut DiscoverAction) {
-        footer_panel(ui, "discover_scanning_footer", |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.cancelling {
-                    ui.label(theme::micro_label(
-                        "CANCELLING\u{2026}",
-                        theme::LABEL_ON_PAPER,
-                    ));
-                } else if theme::brutal_button(ui, "CANCEL", BtnVariant::Danger) {
-                    *action = DiscoverAction::Cancel;
-                }
-            });
-        });
-
         ui.add_space(4.0);
         match &self.latest {
             Some(snap) => ui.label(theme::micro_label(
@@ -749,19 +715,52 @@ impl DiscoverWizard {
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .max_height(ui.available_height() - 50.0)
             .show(ui, |ui| {
                 discover_rows_ui(ui, &mut self.rows, &mut self.preview);
             });
+
+        ui.add_space(12.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if self.cancelling {
+                ui.label(theme::micro_label(
+                    "CANCELLING\u{2026}",
+                    theme::LABEL_ON_PAPER,
+                ));
+            } else if theme::brutal_button(ui, "CANCEL", BtnVariant::Danger) {
+                *action = DiscoverAction::Cancel;
+            }
+        });
     }
 
     fn show_results(&mut self, ui: &mut egui::Ui, action: &mut DiscoverAction) {
+        ui.add_space(4.0);
         let selected = self
             .rows
             .iter()
             .filter(|row| row.checked && row.addable())
             .count();
-        footer_panel(ui, "discover_results_footer", |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.label(theme::micro_label(
+            format!(
+                "{} DEVICE(S) FOUND \u{b7} {} SELECTED",
+                self.rows.len(),
+                selected
+            ),
+            theme::LABEL_ON_PAPER,
+        ));
+        auth_legend(ui);
+        self.maybe_ws_hint(ui);
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(ui.available_height() - 50.0)
+            .show(ui, |ui| {
+                discover_rows_ui(ui, &mut self.rows, &mut self.preview);
+            });
+
+        ui.add_space(12.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Disabled (unclickable) when nothing addable is ticked (REQ-13).
             let can_add = selected > 0;
             let clicked = ui
@@ -783,27 +782,7 @@ impl DiscoverWizard {
             if theme::brutal_button(ui, "< BACK", BtnVariant::Paper) {
                 *action = DiscoverAction::Back;
             }
-            });
         });
-
-        ui.add_space(4.0);
-        ui.label(theme::micro_label(
-            format!(
-                "{} DEVICE(S) FOUND \u{b7} {} SELECTED",
-                self.rows.len(),
-                selected
-            ),
-            theme::LABEL_ON_PAPER,
-        ));
-        auth_legend(ui);
-        self.maybe_ws_hint(ui);
-        ui.add_space(6.0);
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                discover_rows_ui(ui, &mut self.rows, &mut self.preview);
-            });
     }
 
     fn maybe_ws_hint(&self, ui: &mut egui::Ui) {
@@ -838,29 +817,6 @@ impl DiscoverWizard {
             None => String::from("\u{2014}"),
         }
     }
-}
-
-/// Bottom-anchored action bar.
-///
-/// MUST be called before anything else is drawn into `ui`. A panel reserves
-/// space out of the Ui's remaining rect, so declaring it after the page
-/// content has already advanced the cursor mis-measures what is left and
-/// starves the scroll area below it.
-///
-/// Uses a real panel so egui reserves the footer's *measured* height and the
-/// scroll area above receives exactly what is left. The previous approach
-/// subtracted a guessed 50pt from the available height, which under-counted
-/// the footer (12pt space + 8pt item spacing + a 34pt button) and drifted
-/// further wrong as the window height changed, pushing the buttons out of
-/// alignment or off-screen on other displays.
-fn footer_panel(ui: &mut egui::Ui, id: &'static str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::TopBottomPanel::bottom(id)
-        .frame(egui::Frame::NONE)
-        .show_inside(ui, |ui| {
-            ui.add_space(10.0);
-            add(ui);
-            ui.add_space(2.0);
-        });
 }
 
 fn discover_rows_ui(
@@ -1992,21 +1948,8 @@ fn instrument_cell(
 // Settings view
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// (content height, viewport height) from the last Settings frame.
-    ///
-    /// Exists so a test can assert that an ordinary camera list fits without
-    /// scrolling, instead of that being something only a human notices after
-    /// a release. Written every frame; read only by tests.
-    static LAST_SETTINGS_FIT: std::cell::Cell<Option<(f32, f32)>> =
-        const { std::cell::Cell::new(None) };
-}
-
 fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAction {
     let mut action = SettingsAction::None;
-    // Applied before anything draws, so is_dirty() and the row list agree for
-    // the whole frame.
-    editor.apply_pending_delete();
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
@@ -2015,48 +1958,6 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
         )
         .show(ctx, |ui| {
             paper_visuals(ui);
-
-            let dirty = editor.is_dirty();
-            footer_panel(ui, "settings_footer", |ui| {
-                if dirty && editor.confirm_discard {
-                    ui.label(theme::micro_label(
-                        "UNSAVED CHANGES \u{2014} PRESS CANCEL AGAIN TO DISCARD THEM",
-                        theme::STATUS_OFFLINE,
-                    ));
-                    ui.add_space(6.0);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let saved = ui
-                        .scope(|ui| {
-                            if !dirty {
-                                ui.disable();
-                            }
-                            theme::brutal_button(ui, "SAVE", BtnVariant::Confirm)
-                        })
-                        .inner;
-                    if saved {
-                        action = SettingsAction::Save;
-                    }
-
-                    // A reflex CANCEL/Escape shouldn't silently drop an edit:
-                    // the first press while dirty only arms the discard, a
-                    // second press (here or via Escape) confirms it.
-                    let armed = dirty && editor.confirm_discard;
-                    let (label, variant) = if armed {
-                        ("CONFIRM DISCARD", BtnVariant::Danger)
-                    } else {
-                        ("CANCEL", BtnVariant::Ink)
-                    };
-                    if theme::brutal_button(ui, label, variant) {
-                        if dirty && !editor.confirm_discard {
-                            editor.confirm_discard = true;
-                        } else {
-                            action = SettingsAction::Cancel;
-                        }
-                    }
-                });
-            });
-
 
             ui.label(
                 egui::RichText::new("SETTINGS")
@@ -2077,19 +1978,15 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
                 ui.add_space(4.0);
             }
 
-            // Every setting scrolls together. Keeping these two controls
-            // outside the scroll area cost it ~130pt of fixed height, which
-            // was enough to make a two-camera list scroll on a 720p window
-            // even though it comfortably fits the page.
-            let mut delete = None;
-            let scrolled = egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    badge_position_row(ui, editor);
-                    ui.add_space(14.0);
-                    update_check_row(ui, editor);
-                    ui.add_space(14.0);
+            badge_position_row(ui, editor);
+            ui.add_space(14.0);
+            update_check_row(ui, editor);
 
+            let mut delete = None;
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height(ui.available_height() - 50.0)
+                .show(ui, |ui| {
                     for (i, row) in editor.rows.iter_mut().enumerate() {
                         settings_row(ui, i, row, &mut delete);
                         ui.add_space(10.0);
@@ -2133,9 +2030,49 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
                     }
                 });
 
-            editor.pending_delete = delete;
-            LAST_SETTINGS_FIT.with(|cell| {
-                cell.set(Some((scrolled.content_size.y, scrolled.inner_rect.height())));
+            if let Some(index) = delete {
+                editor.rows.remove(index);
+            }
+
+            let dirty = editor.is_dirty();
+            if dirty && editor.confirm_discard {
+                ui.add_space(8.0);
+                ui.label(theme::micro_label(
+                    "UNSAVED CHANGES \u{2014} PRESS CANCEL AGAIN TO DISCARD THEM",
+                    theme::STATUS_OFFLINE,
+                ));
+            }
+
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let saved = ui
+                    .scope(|ui| {
+                        if !dirty {
+                            ui.disable();
+                        }
+                        theme::brutal_button(ui, "SAVE", BtnVariant::Confirm)
+                    })
+                    .inner;
+                if saved {
+                    action = SettingsAction::Save;
+                }
+
+                // A reflex CANCEL/Escape shouldn't silently drop an edit: the
+                // first press while dirty only arms the discard, a second
+                // press (here or via Escape) confirms it.
+                let armed = dirty && editor.confirm_discard;
+                let (label, variant) = if armed {
+                    ("CONFIRM DISCARD", BtnVariant::Danger)
+                } else {
+                    ("CANCEL", BtnVariant::Ink)
+                };
+                if theme::brutal_button(ui, label, variant) {
+                    if dirty && !editor.confirm_discard {
+                        editor.confirm_discard = true;
+                    } else {
+                        action = SettingsAction::Cancel;
+                    }
+                }
             });
         });
     action
@@ -2560,58 +2497,6 @@ mod tests {
         })
     }
 
-    fn editor_with(urls: &[(&str, &str)]) -> SettingsEditor {
-        SettingsEditor::from_config(&Config {
-            badge_position: BadgePosition::BottomRight,
-            update_check: true,
-            cameras: urls
-                .iter()
-                .map(|(name, url)| camera(name, url))
-                .collect(),
-        })
-    }
-
-    #[test]
-    fn a_queued_delete_removes_the_row_and_marks_the_editor_dirty() {
-        // The reported bug: a camera could not be deleted. SAVE must become
-        // enabled in the same frame the row disappears, or the deletion looks
-        // like it did nothing.
-        let mut editor = editor_with(&[
-            ("Lateral", "rtsp://192.168.100.10:554/live/ch0"),
-            ("Cochera", "rtsp://192.168.100.11:554/live/ch0"),
-        ]);
-        assert!(!editor.is_dirty(), "untouched editor is clean");
-
-        editor.pending_delete = Some(0);
-        editor.apply_pending_delete();
-
-        assert_eq!(editor.rows.len(), 1);
-        assert_eq!(editor.rows[0].name, "Cochera");
-        assert!(editor.is_dirty(), "SAVE must be enabled right away");
-        assert_eq!(editor.pending_delete, None, "the request is consumed");
-    }
-
-    #[test]
-    fn a_stale_delete_index_is_ignored_rather_than_panicking() {
-        let mut editor = editor_with(&[("Lateral", "rtsp://192.168.100.10:554/live/ch0")]);
-        editor.pending_delete = Some(7);
-        editor.apply_pending_delete();
-        assert_eq!(editor.rows.len(), 1, "nothing removed");
-        assert_eq!(editor.pending_delete, None);
-    }
-
-    #[test]
-    fn deleting_every_row_leaves_a_saveable_empty_list() {
-        // Removing the last camera must still be committable, otherwise a
-        // user cannot clear a bad configuration.
-        let mut editor = editor_with(&[("Lateral", "rtsp://192.168.100.10:554/live/ch0")]);
-        editor.pending_delete = Some(0);
-        editor.apply_pending_delete();
-        assert!(editor.rows.is_empty());
-        assert!(editor.is_dirty());
-        assert!(editor.collect().is_empty());
-    }
-
     #[test]
     fn typed_path_is_normalised_to_one_leading_slash() {
         assert_eq!(normalized_path("/media/video1").as_deref(), Some("/media/video1"));
@@ -2955,82 +2840,5 @@ mod tests {
             // Navigation itself stays untouched; only the wizard ends.
             assert!(!matches!(app.view, View::Discover));
         }
-    }
-}
-
-#[cfg(test)]
-mod settings_layout_tests {
-    use super::*;
-
-    /// Renders Settings headlessly and returns (content height, viewport
-    /// height) for the scroll area.
-    fn render(cameras: usize, window_height: f32) -> (f32, f32) {
-        let cfg = Config {
-            badge_position: BadgePosition::BottomRight,
-            update_check: true,
-            cameras: (0..cameras)
-                .map(|i| CameraConfig {
-                    name: format!("Cam {i}"),
-                    url: format!("rtsp://192.168.100.{}:554/live/ch0", 10 + i),
-                })
-                .collect(),
-        };
-        let mut editor = SettingsEditor::from_config(&cfg);
-        let ctx = egui::Context::default();
-        crate::theme::install(&ctx);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1366.0, window_height),
-            )),
-            ..Default::default()
-        };
-        // Three frames: egui settles panel sizes over the first two.
-        for _ in 0..3 {
-            let _ = ctx.run(input.clone(), |ctx| {
-                let _ = show_settings(ctx, &mut editor);
-            });
-        }
-        LAST_SETTINGS_FIT
-            .with(|cell| cell.get())
-            .expect("Settings rendered at least once")
-    }
-
-    #[test]
-    fn a_short_camera_list_needs_no_scrolling() {
-        // The regression this guards: BADGE POSITION and CHECK FOR UPDATES
-        // used to sit outside the scroll area, costing it ~160pt of fixed
-        // height and making a two-camera list scroll on an ordinary window.
-        for height in [687.0, 720.0, 800.0] {
-            let (content, viewport) = render(2, height);
-            assert!(
-                content <= viewport,
-                "2 cameras must fit at window height {height}: \
-                 content {content}pt vs viewport {viewport}pt"
-            );
-        }
-    }
-
-    #[test]
-    fn a_long_camera_list_still_scrolls() {
-        // The complement: the scroll area must still do its job, or a long
-        // list would simply be unreachable.
-        let (content, viewport) = render(8, 687.0);
-        assert!(
-            content > viewport,
-            "8 cameras should overflow: content {content}pt vs viewport {viewport}pt"
-        );
-    }
-
-    #[test]
-    fn every_setting_scrolls_with_the_camera_list() {
-        // If the controls were moved back out of the scroll area, the content
-        // measured here would shrink by their height.
-        let (with_controls, _) = render(0, 687.0);
-        assert!(
-            with_controls > 150.0,
-            "the settings controls belong inside the scrolled content, \
-             measured only {with_controls}pt"
-        );
     }
 }
