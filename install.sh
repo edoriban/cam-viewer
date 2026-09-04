@@ -107,6 +107,35 @@ if [ -n "${OTHERS}" ]; then
     say "Delete them, then re-run this script."
 fi
 
+# Same failure as a stale binary, one layer up: a launcher written by hand
+# under another filename keeps pointing at the old path, so the menu icon
+# still opens the version that was just replaced.
+STALE_ENTRIES=$(
+    for dir in "${DESKTOP_DIR}" "${HOME}/.local/share/applications" \
+               /usr/share/applications /usr/local/share/applications; do
+        [ -d "${dir}" ] || continue
+        for entry in "${dir}"/*.desktop; do
+            [ -f "${entry}" ] || continue
+            [ "${entry}" = "${DESKTOP}" ] && continue
+            if grep -q '^Exec=.*cam-viewer' "${entry}" 2>/dev/null; then
+                printf '%s\n' "${entry}"
+            fi
+        done
+    done | sort -u
+)
+if [ -n "${STALE_ENTRIES}" ]; then
+    say ""
+    say "WARNING: other desktop entries launch cam-viewer:"
+    printf '%s\n' "${STALE_ENTRIES}" | while IFS= read -r entry; do
+        [ -n "${entry}" ] || continue
+        target=$(sed -n 's/^Exec=//p' "${entry}" | head -n 1)
+        say "  ${entry}"
+        say "      runs: ${target}"
+    done
+    say ""
+    say "Their menu icons still open whatever path they name. Delete them."
+fi
+
 case ":${PATH}:" in
     *":${BIN_DIR}:"*) ;;
     *)
