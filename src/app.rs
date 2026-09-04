@@ -407,6 +407,42 @@ struct DiscoverWizard {
     cancelling: bool,
     /// WS-Discovery hint inputs (found, degraded), set once past Configuring.
     ws: Option<(u32, bool)>,
+    /// The single live preview, if any. Deliberately one at a time: each one
+    /// is an ffmpeg process piping full-resolution frames, so previewing every
+    /// row at once would cost more than the whole scan.
+    preview: Option<Preview>,
+}
+
+/// A live look at one discovered address, so two identical cameras can be
+/// told apart by what they actually see rather than by guessing.
+struct Preview {
+    url: String,
+    stream: StreamHandle,
+    texture: Option<(u64, egui::TextureHandle)>,
+}
+
+impl Preview {
+    fn start(url: String) -> Self {
+        Self {
+            stream: StreamHandle::spawn(url.clone()),
+            url,
+            texture: None,
+        }
+    }
+
+    /// Latest frame as a texture, or `None` while connecting.
+    fn texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        let frame = self.stream.latest_frame()?;
+        if let Some((generation, tex)) = &self.texture
+            && *generation == frame.generation
+        {
+            return Some(tex.clone());
+        }
+        let image = egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
+        let tex = ctx.load_texture("discover-preview", image, egui::TextureOptions::LINEAR);
+        self.texture = Some((frame.generation, tex.clone()));
+        Some(tex)
+    }
 }
 
 impl DiscoverWizard {
@@ -425,6 +461,7 @@ impl DiscoverWizard {
             error: None,
             cancelling: false,
             ws: None,
+            preview: None,
         }
     }
 
@@ -655,7 +692,7 @@ impl DiscoverWizard {
             .auto_shrink([false, false])
             .max_height(ui.available_height() - 50.0)
             .show(ui, |ui| {
-                discover_rows_ui(ui, &mut self.rows);
+                discover_rows_ui(ui, &mut self.rows, &mut self.preview);
             });
 
         ui.add_space(12.0);
@@ -694,7 +731,7 @@ impl DiscoverWizard {
             .auto_shrink([false, false])
             .max_height(ui.available_height() - 50.0)
             .show(ui, |ui| {
-                discover_rows_ui(ui, &mut self.rows);
+                discover_rows_ui(ui, &mut self.rows, &mut self.preview);
             });
 
         ui.add_space(12.0);
@@ -757,14 +794,18 @@ impl DiscoverWizard {
     }
 }
 
-fn discover_rows_ui(ui: &mut egui::Ui, rows: &mut [DiscoverRow]) {
+fn discover_rows_ui(
+    ui: &mut egui::Ui,
+    rows: &mut [DiscoverRow],
+    preview: &mut Option<Preview>,
+) {
     for row in rows {
-        discover_row_card(ui, row);
+        discover_row_card(ui, row, preview);
         ui.add_space(8.0);
     }
 }
 
-fn discover_row_card(ui: &mut egui::Ui, row: &mut DiscoverRow) {
+fn discover_row_card(ui: &mut egui::Ui, row: &mut DiscoverRow, preview: &mut Option<Preview>) {
     let border = if row.checked {
         theme::STATUS_OFFLINE
     } else {
@@ -829,6 +870,45 @@ fn discover_row_card(ui: &mut egui::Ui, row: &mut DiscoverRow) {
                     });
                 });
             });
+            // Two identical cameras are indistinguishable on paper: same
+            // path, port, resolution and vendor. Seeing the picture is the
+            // only thing that actually tells them apart.
+            if let Some(url) = row.effective_url() {
+                let showing = preview.as_ref().is_some_and(|p| p.url == url);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if showing {
+                        if theme::brutal_button(ui, "HIDE PREVIEW", BtnVariant::Paper) {
+                            *preview = None; // Drop stops the ffmpeg process.
+                        }
+                    } else if theme::brutal_button(ui, "PREVIEW", BtnVariant::Paper) {
+                        // Replacing the previous preview stops it: only one
+                        // stream runs at a time.
+                        *preview = Some(Preview::start(url.clone()));
+                    }
+                });
+                if showing {
+                    let tex = preview.as_mut().and_then(|p| p.texture(ui.ctx()));
+                    ui.add_space(4.0);
+                    match tex {
+                        Some(tex) => {
+                            let width = ui.available_width().min(320.0);
+                            let size = tex.size_vec2();
+                            let height = if size.x > 0.0 {
+                                width * size.y / size.x
+                            } else {
+                                width * 9.0 / 16.0
+                            };
+                            ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(
+                                width, height,
+                            )));
+                        }
+                        None => {
+                            ui.label(theme::micro_label("CONNECTING\u{2026}", theme::LABEL_ON_PAPER));
+                        }
+                    }
+                }
+            }
             // Full contrast, outside the fade: this is what turns a
             // "new camera" row into "the camera you already had, moved".
             if !row.relink_options.is_empty() {
@@ -2148,6 +2228,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn preview_remembers_the_exact_url_it_was_started_with() {
+        // The row decides whether to show PREVIEW or HIDE PREVIEW by comparing
+        // this string with effective_url(). Any rewriting here and the button
+        // would never flip to HIDE, leaving a stream the user cannot stop.
+        let url = "rtsp://192.168.100.22:554/live/ch0";
+        let preview = Preview::start(url.to_owned());
+        assert_eq!(preview.url, url);
+        preview.stream.stop();
+    }
+
+    #[test]
+    fn a_relinked_row_still_offers_a_preview_url() {
+        // Preview is only useful on exactly the rows that are ambiguous, so
+        // choosing a relink target must not remove the URL it previews.
+        let mut row = DiscoverRow::new(found(
+            [192, 168, 100, 22],
+            "rtsp://192.168.100.22:554/live/ch0",
+        ));
+        row.relink_to = Some("Lateral".to_owned());
+        assert_eq!(
+            row.effective_url().as_deref(),
+            Some("rtsp://192.168.100.22:554/live/ch0")
+        );
+    }
+
     fn found(ip: [u8; 4], url: &str) -> DiscoveryResult {
         DiscoveryResult {
             ip: Ipv4Addr::from(ip),
@@ -2547,6 +2653,7 @@ mod tests {
             error: None,
             cancelling: false,
             ws: None,
+            preview: None,
         };
         wizard.handle = Some(DiscoveryHandle::start(DiscoveryConfig {
             subnet: net::Subnet {
