@@ -21,11 +21,17 @@ pub enum BadgePosition {
 pub struct CameraConfig {
     pub name: String,
     pub url: String,
+    #[serde(default = "default_true")]
+    pub muted: bool,
 }
 
 /// Opt-out default for [`Config::update_check`]: a user who never heard of
 /// this build has no other way to learn a fix shipped.
 fn default_update_check() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -105,10 +111,12 @@ mod tests {
                 CameraConfig {
                     name: "Front".to_owned(),
                     url: "rtsp://192.168.1.10/live".to_owned(),
+                    muted: true,
                 },
                 CameraConfig {
                     name: "Back".to_owned(),
                     url: "rtsp://192.168.1.11/live".to_owned(),
+                    muted: false,
                 },
             ],
         }
@@ -149,6 +157,13 @@ mod tests {
         assert!(loaded.cameras.is_empty());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_camera_without_muted_defaults_to_true() {
+        let raw = "[[cameras]]\nname = \"Front\"\nurl = \"rtsp://192.168.1.10/live\"\n";
+        let parsed: Config = toml::from_str(raw).expect("parse legacy config");
+        assert!(parsed.cameras[0].muted);
     }
 
     #[test]

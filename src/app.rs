@@ -37,6 +37,7 @@ struct CameraView {
 struct SettingsRow {
     name: String,
     url: String,
+    muted: bool,
 }
 
 pub struct SettingsEditor {
@@ -60,6 +61,7 @@ impl SettingsEditor {
                 .map(|cam| SettingsRow {
                     name: cam.name.clone(),
                     url: cam.url.clone(),
+                    muted: cam.muted,
                 })
                 .collect(),
             badge_position: config.badge_position,
@@ -82,6 +84,7 @@ impl SettingsEditor {
         self.rows.push(SettingsRow {
             name: format!("Cam {}", self.rows.len() + 1),
             url: String::new(),
+            muted: true,
         });
     }
 
@@ -102,6 +105,7 @@ impl SettingsEditor {
                         name.to_owned()
                     },
                     url: url.to_owned(),
+                    muted: row.muted,
                 })
             })
             .collect()
@@ -354,6 +358,7 @@ fn selected_cameras(rows: &[DiscoverRow], existing_count: usize) -> Vec<CameraCo
                 existing_count + i + 1,
             ),
             url: row.effective_url().unwrap_or_default(),
+            muted: true,
         })
         .collect()
 }
@@ -449,7 +454,7 @@ struct Preview {
 impl Preview {
     fn start(url: String) -> Self {
         Self {
-            stream: StreamHandle::spawn(url.clone()),
+            stream: StreamHandle::spawn(url.clone(), true),
             url,
             texture: None,
         }
@@ -1080,7 +1085,7 @@ impl CamViewerApp {
             .map(|cam| CameraView {
                 name: cam.name.clone(),
                 url: cam.url.clone(),
-                stream: StreamHandle::spawn(cam.url.clone()),
+                stream: StreamHandle::spawn(cam.url.clone(), cam.muted),
                 texture: None,
             })
             .collect();
@@ -1167,6 +1172,7 @@ impl CamViewerApp {
             .map(|cam| CameraConfig {
                 name: cam.name.clone(),
                 url: cam.url.clone(),
+                muted: cam.stream.muted(),
             })
             .collect()
     }
@@ -1293,7 +1299,7 @@ impl CamViewerApp {
                 None => CameraView {
                     name: cam.name.clone(),
                     url: cam.url.clone(),
-                    stream: StreamHandle::spawn(cam.url.clone()),
+                    stream: StreamHandle::spawn(cam.url.clone(), cam.muted),
                     texture: None,
                 },
             });
@@ -1356,7 +1362,12 @@ impl eframe::App for CamViewerApp {
             },
             View::Solo(index) => {
                 if index >= self.cameras.len()
-                    || show_solo(ctx, &mut self.cameras[index], self.badge_position)
+                    || show_solo(
+                        ctx,
+                        &mut self.cameras[index],
+                        index,
+                        self.badge_position,
+                    )
                 {
                     self.view = View::Grid;
                 }
@@ -1691,6 +1702,7 @@ fn draw_grid_rows(
                     egui::vec2(layout.tile_w, layout.tile_h),
                     true,
                     badge_position,
+                    egui::Id::new(("grid_camera", i)),
                 );
                 if clicked && opened.is_none() {
                     *opened = Some(i);
@@ -1710,11 +1722,35 @@ fn video_surface(
     size: egui::Vec2,
     overlays: bool,
     badge_position: BadgePosition,
+    surface_id: egui::Id,
 ) -> bool {
     let size = size.max(egui::vec2(80.0, 60.0));
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme::SOOT_2);
+
+    let is_muted = cam.stream.muted();
+    let mute_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 4.0, rect.top() + 4.0),
+        egui::vec2(24.0, 24.0),
+    );
+    let mute_response = ui.interact(
+        mute_rect,
+        surface_id.with("mute"),
+        egui::Sense::click(),
+    );
+    if mute_response.clicked() {
+        cam.stream.set_muted(!is_muted);
+    }
+    let text = if is_muted { "MUTE" } else { "UNMUTE" };
+    let text_color = if is_muted { theme::STATUS_OFFLINE } else { theme::STATUS_ONLINE };
+    painter.text(
+        mute_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        theme::mono_font(14.0),
+        text_color,
+    );
 
     match cam.stream.latest_frame() {
         Some(frame) => {
@@ -1737,6 +1773,8 @@ fn video_surface(
             center_message(&painter, rect, msg);
         }
     }
+
+    recording_control(ui, cam, rect, false, surface_id);
 
     let hovered = response.hovered();
     let border = if overlays && hovered {
@@ -1779,6 +1817,81 @@ fn video_surface(
     response.clicked()
 }
 
+fn recording_control(
+    ui: &mut egui::Ui,
+    cam: &CameraView,
+    rect: egui::Rect,
+    paper: bool,
+    surface_id: egui::Id,
+) {
+    let mut state = cam.stream.recording_state();
+    let active = state == crate::stream::RecordingState::Recording;
+    let control_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - 58.0, rect.top() + 4.0),
+        egui::vec2(54.0, 24.0),
+    );
+    let response = ui.interact(
+        control_rect,
+        surface_id.with("recording"),
+        egui::Sense::click(),
+    );
+    if response.clicked() {
+        if active {
+            cam.stream.stop_recording();
+        } else {
+            let filename = cam.name.replace(['/', '\\', ' '], "_");
+            if let Err(error) = cam
+                .stream
+                .start_recording(format!("{filename}-recording.mp4"))
+            {
+                // StreamHandle stores the exact error in RecordingState so it
+                // is rendered on the next frame and available on hover.
+                state = cam.stream.recording_state();
+                debug_assert!(matches!(
+                    &state,
+                    crate::stream::RecordingState::Failed(message) if message == &error
+                ));
+            }
+        }
+    }
+    let label = if active { "STOP" } else { "RECORD" };
+    let color = if active {
+        theme::STATUS_OFFLINE
+    } else if matches!(state, crate::stream::RecordingState::Failed(_)) {
+        theme::STATUS_OFFLINE
+    } else if paper {
+        theme::INK
+    } else {
+        theme::PAPER
+    };
+    let painter = ui.painter_at(control_rect);
+    if let crate::stream::RecordingState::Failed(error) = &state {
+        let message = theme::elide_to_width(
+            &painter,
+            &format!("RECORD FAILED: {error}"),
+            theme::mono_font(9.0),
+            control_rect.width(),
+            theme::STATUS_OFFLINE,
+        );
+        painter.text(
+            control_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            message,
+            theme::mono_font(9.0),
+            theme::STATUS_OFFLINE,
+        );
+        response.on_hover_text(error);
+    } else {
+        painter.text(
+            control_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            theme::mono_font(10.0),
+            color,
+        );
+    }
+}
+
 fn center_message(painter: &egui::Painter, rect: egui::Rect, text: impl Into<String>) {
     painter.text(
         rect.center(),
@@ -1793,7 +1906,12 @@ fn center_message(painter: &egui::Painter, rect: egui::Rect, text: impl Into<Str
 // Solo view
 // ---------------------------------------------------------------------------
 
-fn show_solo(ctx: &egui::Context, cam: &mut CameraView, badge_position: BadgePosition) -> bool {
+fn show_solo(
+    ctx: &egui::Context,
+    cam: &mut CameraView,
+    camera_index: usize,
+    badge_position: BadgePosition,
+) -> bool {
     let mut back = false;
 
     egui::TopBottomPanel::top("solo_top")
@@ -1843,7 +1961,7 @@ fn show_solo(ctx: &egui::Context, cam: &mut CameraView, badge_position: BadgePos
                     bottom: 18,
                 }),
         )
-        .show(ctx, |ui| instrument_row(ui, cam));
+        .show(ctx, |ui| instrument_row(ui, cam, camera_index));
 
     egui::CentralPanel::default()
         .frame(
@@ -1857,13 +1975,20 @@ fn show_solo(ctx: &egui::Context, cam: &mut CameraView, badge_position: BadgePos
                 }),
         )
         .show(ctx, |ui| {
-            video_surface(ui, cam, ui.available_size(), false, badge_position);
+            video_surface(
+                ui,
+                cam,
+                ui.available_size(),
+                false,
+                badge_position,
+                egui::Id::new(("solo_camera", camera_index)),
+            );
         });
 
     back
 }
 
-fn instrument_row(ui: &mut egui::Ui, cam: &CameraView) {
+fn instrument_row(ui: &mut egui::Ui, cam: &CameraView, camera_index: usize) {
     let width = ui.available_width();
     let height = 56.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
@@ -1874,6 +1999,37 @@ fn instrument_row(ui: &mut egui::Ui, cam: &CameraView) {
         0.0,
         egui::Stroke::new(2.0_f32, theme::INK),
         egui::StrokeKind::Inside,
+    );
+
+    let is_muted = cam.stream.muted();
+    let mute_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 4.0, rect.top() + 4.0),
+        egui::vec2(24.0, 24.0),
+    );
+    let mute_response = ui.interact(
+        mute_rect,
+        egui::Id::new(("solo_instrument_mute", camera_index)),
+        egui::Sense::click(),
+    );
+    if mute_response.clicked() {
+        cam.stream.set_muted(!is_muted);
+    }
+    let text = if is_muted { "MUTE" } else { "UNMUTE" };
+    let text_color = if is_muted { theme::STATUS_OFFLINE } else { theme::STATUS_ONLINE };
+    painter.text(
+        mute_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        theme::mono_font(14.0),
+        text_color,
+    );
+
+    recording_control(
+        ui,
+        cam,
+        rect,
+        true,
+        egui::Id::new(("solo_instrument", camera_index)),
     );
 
     let status = cam.stream.status();
@@ -2575,6 +2731,7 @@ mod tests {
         CameraConfig {
             name: name.to_owned(),
             url: url.to_owned(),
+            muted: true,
         }
     }
 

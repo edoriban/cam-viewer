@@ -41,6 +41,13 @@ pub struct Frame {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordingState {
+    Idle,
+    Recording,
+    Failed(String),
+}
+
 #[derive(Clone)]
 struct Shared {
     frame: Arc<Mutex<Option<Arc<Frame>>>>,
@@ -48,6 +55,10 @@ struct Shared {
     child: Arc<Mutex<Option<Child>>>,
     shutdown: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
+    url: String,
+    recording: Arc<Mutex<Option<Child>>>,
+    recording_state: Arc<Mutex<RecordingState>>,
 }
 
 pub struct StreamHandle {
@@ -55,16 +66,20 @@ pub struct StreamHandle {
 }
 
 impl StreamHandle {
-    pub fn spawn(url: impl Into<String>) -> Self {
+    pub fn spawn(url: impl Into<String>, muted: bool) -> Self {
+        let url = url.into();
         let shared = Shared {
             frame: Arc::new(Mutex::new(None)),
             status: Arc::new(Mutex::new(Status::Connecting)),
             child: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(muted)),
+            url: url.clone(),
+            recording: Arc::new(Mutex::new(None)),
+            recording_state: Arc::new(Mutex::new(RecordingState::Idle)),
         };
         let thread_shared = shared.clone();
-        let url = url.into();
         thread::Builder::new()
             .name("cam-stream".to_owned())
             .spawn(move || run_loop(thread_shared, &url))
@@ -82,12 +97,108 @@ impl StreamHandle {
 
     pub fn stop(&self) {
         self.shared.shutdown.store(true, Ordering::Relaxed);
+        self.stop_recording();
         stop_child(&self.shared.child);
     }
 
     pub fn set_paused(&self, paused: bool) {
         self.shared.paused.store(paused, Ordering::Relaxed);
     }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.shared.muted.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn muted(&self) -> bool {
+        self.shared.muted.load(Ordering::Relaxed)
+    }
+
+    pub fn recording_state(&self) -> RecordingState {
+        let mut child_slot = lock(&self.shared.recording);
+        if let Some(child) = child_slot.as_mut() {
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => {
+                    child_slot.take();
+                    let mut state = lock(&self.shared.recording_state);
+                    *state = if status.success() {
+                        RecordingState::Idle
+                    } else {
+                        RecordingState::Failed("ffmpeg recording exited with an error".to_owned())
+                    };
+                }
+                Err(error) => {
+                    child_slot.take();
+                    *lock(&self.shared.recording_state) =
+                        RecordingState::Failed(format!("checking recording process: {error}"));
+                }
+            }
+        }
+        lock(&self.shared.recording_state).clone()
+    }
+
+    pub fn start_recording(&self, path: impl Into<String>) -> Result<(), String> {
+        // Keep the duplicate check, process creation, and child publication
+        // under one mutex. Otherwise two callers can both observe Idle and
+        // spawn separate ffmpeg children before either publishes its child.
+        let mut recording = lock(&self.shared.recording);
+        if let Some(child) = recording.as_mut() {
+            match child.try_wait() {
+                Ok(None) => {
+                    *lock(&self.shared.recording_state) = RecordingState::Recording;
+                    return Ok(());
+                }
+                Ok(Some(status)) => {
+                    recording.take();
+                    *lock(&self.shared.recording_state) = if status.success() {
+                        RecordingState::Idle
+                    } else {
+                        RecordingState::Failed("ffmpeg recording exited with an error".to_owned())
+                    };
+                }
+                Err(error) => {
+                    recording.take();
+                    *lock(&self.shared.recording_state) =
+                        RecordingState::Failed(format!("checking recording process: {error}"));
+                }
+            }
+        }
+
+        let path = path.into();
+        let muted = self.shared.muted.load(Ordering::Relaxed);
+        let mut command = no_window_command("ffmpeg");
+        command.args(["-nostdin", "-v", "error", "-rtsp_transport", "tcp"]);
+        command.args(["-i", &self.shared.url, "-map", "0:v:0"]);
+        if !muted {
+            command.args(["-map", "0:a?"]);
+        }
+        command.args(["-c", "copy", "-f", "mp4", &path]);
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let message = format!("starting recording: {error}");
+                *lock(&self.shared.recording_state) = RecordingState::Failed(message.clone());
+                return Err(message);
+            }
+        };
+        *recording = Some(child);
+        *lock(&self.shared.recording_state) = RecordingState::Recording;
+        Ok(())
+    }
+
+    pub fn stop_recording(&self) {
+        stop_child(&self.shared.recording);
+        *lock(&self.shared.recording_state) = RecordingState::Idle;
+    }
+
+    pub fn grab_start(&self, path: impl Into<String>) -> Result<(), String> {
+        self.start_recording(path)
+    }
+
+    pub fn grab_stop(&self) {
+        self.stop_recording();
+    }
+
 }
 
 impl Drop for StreamHandle {
@@ -439,6 +550,10 @@ mod ppm_tests {
             child: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(true)),
+            url: "rtsp://127.0.0.1:1/none".to_owned(),
+            recording: Arc::new(Mutex::new(None)),
+            recording_state: Arc::new(Mutex::new(super::RecordingState::Idle)),
         }
     }
 
@@ -541,7 +656,56 @@ mod ppm_tests {
     fn handle_is_constructible_without_ffmpeg_present() {
         // Guards the public surface used by app.rs; the worker thread failing
         // to spawn ffmpeg must not panic the caller.
-        let handle = StreamHandle::spawn("rtsp://127.0.0.1:1/none");
+        let handle = StreamHandle::spawn("rtsp://127.0.0.1:1/none", true);
+        handle.stop();
+    }
+
+    #[test]
+    fn concurrent_recording_starts_publish_at_most_one_child() {
+        let ffmpeg_available = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok();
+        if !ffmpeg_available {
+            eprintln!("ffmpeg not available, skipping");
+            return;
+        }
+
+        let handle = std::sync::Arc::new(StreamHandle::spawn(
+            "rtsp://127.0.0.1:1/none",
+            true,
+        ));
+        let callers = (0..8)
+            .map(|_| {
+                let handle = std::sync::Arc::clone(&handle);
+                std::thread::spawn(move || handle.start_recording("/dev/full"))
+            })
+            .collect::<Vec<_>>();
+        for caller in callers {
+            caller.join().expect("recording caller finishes").expect("start is idempotent");
+        }
+        assert!(handle
+            .shared
+            .recording
+            .lock()
+            .expect("recording lock")
+            .is_some());
+        handle.stop_recording();
+        handle.stop();
+    }
+
+    #[test]
+    fn recording_lifecycle_is_observable_and_stop_is_idempotent() {
+        let handle = StreamHandle::spawn("rtsp://127.0.0.1:1/none", true);
+        assert_eq!(handle.recording_state(), super::RecordingState::Idle);
+        let result = handle.start_recording("/dev/full");
+        assert!(result.is_ok() || matches!(handle.recording_state(), super::RecordingState::Failed(_)));
+        assert!(matches!(
+            handle.recording_state(),
+            super::RecordingState::Recording | super::RecordingState::Failed(_)
+        ));
+        handle.stop_recording();
+        assert_eq!(handle.recording_state(), super::RecordingState::Idle);
         handle.stop();
     }
 }
