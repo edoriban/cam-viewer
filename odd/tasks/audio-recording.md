@@ -19,7 +19,7 @@ Make the in-progress audio mute and recording change compile and deliver a funct
 - [x] T2 — Repair mute persistence and owned recording lifecycle, including independent-review corrections.
 - [x] T3 — Independently verify the corrected candidate. Evidence: no actionable findings; `cargo test` → 120 passed, 1 ignored; `git diff --check` passed.
 - [x] T4 — Create and push the audio/recording work-unit commit. Evidence: `ce4fead feat(recording): add controlled camera capture`, pushed as `origin/fix/audio-recording`, then fast-forwarded locally onto `main`.
-- [ ] T5 — Bump to v0.8.0, build release artifacts, push version/tag, and publish GitHub Release. Route: delegated version metadata repair plus authorized delivery steps. Checks: release builds, remote tag, GitHub Release assets.
+- [x] T5 — Bump to v0.8.0, build release artifacts, push version/tag, publish GitHub Release, and install locally. Evidence: release artifacts uploaded; `~/.local/bin/cam-viewer --version` reports 0.8.0.
 
 ## Acceptance criteria
 - [x] The test suite compiles and passes.
@@ -29,11 +29,14 @@ Make the in-progress audio mute and recording change compile and deliver a funct
 - [x] Repeated grid camera controls have independent egui IDs.
 - [x] Recording start cannot spawn duplicate ffmpeg children under concurrent calls.
 - [x] The UI does not imply audio playback when no audio renderer exists.
-- [ ] v0.8.0 tag and Cargo version match; GitHub Release holds the Linux and Windows artifacts.
+- [x] v0.8.0 tag and Cargo version match; GitHub Release holds the Linux and Windows artifacts.
 
 ## Progress
 - Work-unit commit `ce4fead` created and pushed.
-- v0.8.0 metadata update is in progress.
+- Release commit `318e478 chore(release): bump version to 0.8.0` pushed to `main`.
+- Annotated tag `v0.8.0` published at `318e478`.
+- GitHub Release published with Linux and Windows x86_64 artifacts.
+- v0.8.0 installed locally at `~/.local/bin/cam-viewer`.
 
 ## Next step
-Complete the Cargo metadata bump, run release builds, and publish the annotated tag and GitHub Release.
+Release complete; no further action is required.
