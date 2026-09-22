@@ -59,6 +59,7 @@ struct Shared {
     url: String,
     recording: Arc<Mutex<Option<Child>>>,
     recording_state: Arc<Mutex<RecordingState>>,
+    audio_child: Arc<Mutex<Option<Child>>>,
 }
 
 pub struct StreamHandle {
@@ -78,12 +79,19 @@ impl StreamHandle {
             url: url.clone(),
             recording: Arc::new(Mutex::new(None)),
             recording_state: Arc::new(Mutex::new(RecordingState::Idle)),
+            audio_child: Arc::new(Mutex::new(None)),
         };
         let thread_shared = shared.clone();
         thread::Builder::new()
             .name("cam-stream".to_owned())
             .spawn(move || run_loop(thread_shared, &url))
             .expect("failed to spawn stream thread");
+        let audio_shared = shared.clone();
+        let audio_url = shared.url.clone();
+        thread::Builder::new()
+            .name("cam-audio".to_owned())
+            .spawn(move || audio_loop(audio_shared, &audio_url))
+            .expect("failed to spawn audio thread");
         Self { shared }
     }
 
@@ -99,6 +107,7 @@ impl StreamHandle {
         self.shared.shutdown.store(true, Ordering::Relaxed);
         self.stop_recording();
         stop_child(&self.shared.child);
+        stop_child(&self.shared.audio_child);
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -442,6 +451,115 @@ fn run_loop(shared: Shared, url: &str) {
     stop_child(&shared.child);
 }
 
+/// Mirrors `run_loop`'s reconnect lifecycle for a second, independent ffmpeg
+/// process that decodes only the audio track and plays it through the
+/// default output device. Gated by the same `muted` flag the recording
+/// pipeline already reads, so unmuting a camera does both at once.
+fn audio_loop(shared: Shared, url: &str) {
+    loop {
+        if shared.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        if shared.paused.load(Ordering::Relaxed) || shared.muted.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+
+        let sink = match rodio::DeviceSinkBuilder::open_default_sink() {
+            Ok(sink) => sink,
+            // No output device is not a transient failure; retrying would
+            // just spawn ffmpeg processes nobody can hear.
+            Err(_) => return,
+        };
+        let player = rodio::Player::connect_new(sink.mixer());
+
+        let io_timeout = STREAM_IO_TIMEOUT.as_micros().to_string();
+        let child = no_window_command("ffmpeg")
+            .args(["-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp"])
+            .args(["-timeout", &io_timeout])
+            .args(["-i", url])
+            .args(["-map", "0:a?", "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+
+        let mut child = match child {
+            Ok(child) => child,
+            Err(_) => {
+                audio_sleep_interruptible(&shared, RECONNECT_DELAY);
+                continue;
+            }
+        };
+
+        let mut stdout = child.stdout.take();
+        *lock(&shared.audio_child) = Some(child);
+
+        if let Some(stdout) = stdout.as_mut() {
+            stream_audio_samples(&shared, stdout, &player);
+        }
+
+        stop_child(&shared.audio_child);
+
+        if shared.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        audio_sleep_interruptible(&shared, RECONNECT_DELAY);
+    }
+}
+
+/// Like `sleep_interruptible`, but also wakes early when the camera is
+/// muted mid-wait instead of finishing out a stale reconnect delay.
+fn audio_sleep_interruptible(shared: &Shared, total: Duration) {
+    let step = Duration::from_millis(200);
+    let deadline = Instant::now() + total;
+    while !shared.shutdown.load(Ordering::Relaxed)
+        && !shared.paused.load(Ordering::Relaxed)
+        && !shared.muted.load(Ordering::Relaxed)
+        && Instant::now() < deadline
+    {
+        thread::sleep(step.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+/// Reads raw interleaved `f32le` PCM from ffmpeg's stdout and appends it to
+/// `player` in small chunks as it arrives, so playback starts as soon as the
+/// first bytes land instead of waiting to buffer a whole clip. Returns on
+/// shutdown, pause, mute, or the ffmpeg process exiting.
+fn stream_audio_samples(shared: &Shared, stdout: &mut impl Read, player: &rodio::Player) {
+    let mut raw = [0u8; 8192];
+    let mut leftover: Vec<u8> = Vec::new();
+    loop {
+        if shared.shutdown.load(Ordering::Relaxed)
+            || shared.paused.load(Ordering::Relaxed)
+            || shared.muted.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let read = match stdout.read(&mut raw) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        leftover.extend_from_slice(&raw[..read]);
+        let usable = leftover.len() - (leftover.len() % 4);
+        if usable == 0 {
+            continue;
+        }
+        let samples: Vec<f32> = leftover[..usable]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        leftover.drain(..usable);
+        player.append(rodio::buffer::SamplesBuffer::new(
+            rodio::nz!(1),
+            rodio::nz!(16_000),
+            samples,
+        ));
+    }
+}
+
 /// Reads one whitespace-delimited PPM header token, skipping leading
 /// whitespace and `#` comment lines. Consumes exactly one whitespace byte
 /// after the token, which is the single separator PPM mandates before the
@@ -554,6 +672,7 @@ mod ppm_tests {
             url: "rtsp://127.0.0.1:1/none".to_owned(),
             recording: Arc::new(Mutex::new(None)),
             recording_state: Arc::new(Mutex::new(super::RecordingState::Idle)),
+            audio_child: Arc::new(Mutex::new(None)),
         }
     }
 
