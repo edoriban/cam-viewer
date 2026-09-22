@@ -1730,27 +1730,14 @@ fn video_surface(
     painter.rect_filled(rect, 0.0, theme::SOOT_2);
 
     let is_muted = cam.stream.muted();
-    let mute_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.left() + 4.0, rect.top() + 4.0),
-        egui::vec2(24.0, 24.0),
-    );
-    let mute_response = ui.interact(
-        mute_rect,
-        surface_id.with("mute"),
-        egui::Sense::click(),
-    );
+    let mute_text = if is_muted { "MUTE" } else { "UNMUTE" };
+    let mute_rect = theme::chip_rect(&painter, egui::pos2(rect.left() + 8.0, rect.top() + 8.0), mute_text);
+    let mute_response = ui.interact(mute_rect, surface_id.with("mute"), egui::Sense::click());
     if mute_response.clicked() {
         cam.stream.set_muted(!is_muted);
     }
-    let text = if is_muted { "MUTE" } else { "UNMUTE" };
-    let text_color = if is_muted { theme::STATUS_OFFLINE } else { theme::STATUS_ONLINE };
-    painter.text(
-        mute_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        theme::mono_font(14.0),
-        text_color,
-    );
+    let mute_fg = if is_muted { theme::STATUS_OFFLINE } else { theme::STATUS_ONLINE };
+    theme::draw_chip(&painter, mute_rect, mute_text, mute_fg, theme::SOOT_2);
 
     match cam.stream.latest_frame() {
         Some(frame) => {
@@ -1774,7 +1761,7 @@ fn video_surface(
         }
     }
 
-    recording_control(ui, cam, rect, false, surface_id);
+    recording_control(ui, cam, rect, surface_id);
 
     let hovered = response.hovered();
     let border = if overlays && hovered {
@@ -1817,18 +1804,28 @@ fn video_surface(
     response.clicked()
 }
 
-fn recording_control(
-    ui: &mut egui::Ui,
-    cam: &CameraView,
-    rect: egui::Rect,
-    paper: bool,
-    surface_id: egui::Id,
-) {
+fn recording_control(ui: &mut egui::Ui, cam: &CameraView, rect: egui::Rect, surface_id: egui::Id) {
     let mut state = cam.stream.recording_state();
     let active = state == crate::stream::RecordingState::Recording;
+    let painter = ui.painter_at(rect);
+
+    let text = match &state {
+        crate::stream::RecordingState::Failed(error) => theme::elide_to_width(
+            &painter,
+            &format!("RECORD FAILED: {error}"),
+            theme::mono_font(10.0),
+            170.0,
+            theme::STATUS_OFFLINE,
+        ),
+        _ if active => "STOP".to_owned(),
+        _ => "RECORD".to_owned(),
+    };
+
+    let inset = 8.0;
+    let size = theme::chip_rect(&painter, egui::pos2(0.0, 0.0), &text).size();
     let control_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.right() - 58.0, rect.top() + 4.0),
-        egui::vec2(54.0, 24.0),
+        egui::pos2(rect.right() - inset - size.x, rect.top() + inset),
+        size,
     );
     let response = ui.interact(
         control_rect,
@@ -1854,41 +1851,14 @@ fn recording_control(
             }
         }
     }
-    let label = if active { "STOP" } else { "RECORD" };
-    let color = if active {
-        theme::STATUS_OFFLINE
-    } else if matches!(state, crate::stream::RecordingState::Failed(_)) {
-        theme::STATUS_OFFLINE
-    } else if paper {
-        theme::INK
-    } else {
-        theme::PAPER
+
+    let fg = match &state {
+        crate::stream::RecordingState::Idle => theme::PAPER,
+        _ => theme::STATUS_OFFLINE,
     };
-    let painter = ui.painter_at(control_rect);
+    theme::draw_chip(&painter, control_rect, &text, fg, theme::SOOT_2);
     if let crate::stream::RecordingState::Failed(error) = &state {
-        let message = theme::elide_to_width(
-            &painter,
-            &format!("RECORD FAILED: {error}"),
-            theme::mono_font(9.0),
-            control_rect.width(),
-            theme::STATUS_OFFLINE,
-        );
-        painter.text(
-            control_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            message,
-            theme::mono_font(9.0),
-            theme::STATUS_OFFLINE,
-        );
         response.on_hover_text(error);
-    } else {
-        painter.text(
-            control_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            theme::mono_font(10.0),
-            color,
-        );
     }
 }
 
@@ -2002,10 +1972,8 @@ fn instrument_row(ui: &mut egui::Ui, cam: &CameraView, camera_index: usize) {
     );
 
     let is_muted = cam.stream.muted();
-    let mute_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.left() + 4.0, rect.top() + 4.0),
-        egui::vec2(24.0, 24.0),
-    );
+    let mute_text = if is_muted { "MUTE" } else { "UNMUTE" };
+    let mute_rect = theme::chip_rect(&painter, egui::pos2(rect.left() + 8.0, rect.top() + 8.0), mute_text);
     let mute_response = ui.interact(
         mute_rect,
         egui::Id::new(("solo_instrument_mute", camera_index)),
@@ -2014,21 +1982,13 @@ fn instrument_row(ui: &mut egui::Ui, cam: &CameraView, camera_index: usize) {
     if mute_response.clicked() {
         cam.stream.set_muted(!is_muted);
     }
-    let text = if is_muted { "MUTE" } else { "UNMUTE" };
-    let text_color = if is_muted { theme::STATUS_OFFLINE } else { theme::STATUS_ONLINE };
-    painter.text(
-        mute_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        theme::mono_font(14.0),
-        text_color,
-    );
+    let mute_fg = if is_muted { theme::STATUS_OFFLINE } else { theme::STATUS_ONLINE };
+    theme::draw_chip(&painter, mute_rect, mute_text, mute_fg, theme::SOOT_2);
 
     recording_control(
         ui,
         cam,
         rect,
-        true,
         egui::Id::new(("solo_instrument", camera_index)),
     );
 

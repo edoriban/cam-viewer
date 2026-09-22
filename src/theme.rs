@@ -353,6 +353,28 @@ pub fn status_badge(
     painter.galley(rect.center() - galley.size() / 2.0, galley, text_color);
 }
 
+/// Size of a bordered overlay chip for `text`, anchored at `min`. Callers
+/// measure first so they can `ui.interact` before drawing the chip.
+pub fn chip_rect(painter: &egui::Painter, min: egui::Pos2, text: &str) -> egui::Rect {
+    let galley = painter.layout_no_wrap(text.to_owned(), mono_font(10.0), egui::Color32::WHITE);
+    egui::Rect::from_min_size(min, galley.size() + egui::vec2(12.0, 8.0))
+}
+
+/// Bordered chip for small overlay controls on video surfaces (mute, record).
+/// Same visual language as `status_badge`: filled rect + 2px border + centered mono text.
+pub fn draw_chip(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    text: &str,
+    fg: egui::Color32,
+    bg: egui::Color32,
+) {
+    let galley = painter.layout_no_wrap(text.to_owned(), mono_font(10.0), fg);
+    painter.rect_filled(rect, 0.0, bg);
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(2.0_f32, fg), egui::StrokeKind::Inside);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, fg);
+}
+
 /// Truncate a string with an ellipsis so it fits `max_w` points.
 pub fn elide_to_width(
     painter: &egui::Painter,
