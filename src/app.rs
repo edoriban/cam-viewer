@@ -1613,7 +1613,7 @@ fn show_sidebar(ctx: &egui::Context, view: &View, cameras: &[CameraView]) -> Sid
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if cameras.is_empty() {
-                        ui.label(theme::micro_label("NO CAMERAS CONFIGURED", theme::ASH));
+                        ui.label(theme::micro_label("NO CAMERAS YET", theme::ASH));
                         return;
                     }
                     for (i, cam) in cameras.iter().enumerate() {
@@ -1732,20 +1732,7 @@ fn show_grid(
         .show(ctx, |ui| {
             let avail = ui.available_size();
             if cameras.is_empty() {
-                ui.label(
-                    egui::RichText::new("No cameras configured.")
-                        .font(theme::mono_font(12.0))
-                        .color(theme::ASH),
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if theme::brutal_button(ui, "DISCOVER", BtnVariant::Confirm) {
-                        empty_state_action = GridAction::GoToDiscover;
-                    }
-                    if theme::brutal_button(ui, "+ ADD CAMERA", BtnVariant::Paper) {
-                        empty_state_action = GridAction::GoToSettings;
-                    }
-                });
+                empty_state_action = welcome_view(ui);
                 return;
             }
             let cols = pick_columns(avail, cameras.len());
@@ -1779,6 +1766,106 @@ fn show_grid(
         Some(index) => GridAction::OpenSolo(index),
         None => empty_state_action,
     }
+}
+
+/// First-run / empty-state welcome, shared by the Grid empty state. There is
+/// no separate "welcome view": with T1's `initial_view`, Grid is exactly what
+/// opens for an empty config (absent a pending load error), so this is the
+/// one call site that ever needs to show it — the previous "route to
+/// Settings when the config is empty" landing is what's actually replaced.
+fn welcome_view(ui: &mut egui::Ui) -> GridAction {
+    let mut action = GridAction::None;
+    ui.label(theme::micro_label("WELCOME", theme::ASH));
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("Let's find your cameras")
+            .font(theme::display_font(26.0))
+            .color(theme::PAPER),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(
+            "cam-viewer watches RTSP cameras on your local network. Nothing leaves this machine.",
+        )
+        .font(theme::mono_font(12.0))
+        .color(theme::ghost_text()),
+    );
+    ui.add_space(18.0);
+
+    let narrow = ui.available_width() < 520.0;
+    if narrow {
+        if welcome_option(
+            ui,
+            "Scan this network",
+            "Finds ONVIF and RTSP cameras on your network interfaces.",
+            "DISCOVER",
+            BtnVariant::Confirm,
+        ) {
+            action = GridAction::GoToDiscover;
+        }
+        ui.add_space(10.0);
+        if welcome_option(
+            ui,
+            "I have a URL",
+            "Paste an rtsp:// address, e.g. rtsp://192.168.1.20/stream1",
+            "+ ADD CAMERA",
+            BtnVariant::Paper,
+        ) {
+            action = GridAction::GoToSettings;
+        }
+    } else {
+        ui.horizontal(|ui| {
+            if welcome_option(
+                ui,
+                "Scan this network",
+                "Finds ONVIF and RTSP cameras on your network interfaces.",
+                "DISCOVER",
+                BtnVariant::Confirm,
+            ) {
+                action = GridAction::GoToDiscover;
+            }
+            ui.add_space(16.0);
+            if welcome_option(
+                ui,
+                "I have a URL",
+                "Paste an rtsp:// address, e.g. rtsp://192.168.1.20/stream1",
+                "+ ADD CAMERA",
+                BtnVariant::Paper,
+            ) {
+                action = GridAction::GoToSettings;
+            }
+        });
+    }
+    action
+}
+
+/// One bordered welcome option block (title, body, action button).
+fn welcome_option(
+    ui: &mut egui::Ui,
+    title: &str,
+    body: &str,
+    button: &str,
+    variant: BtnVariant,
+) -> bool {
+    let mut clicked = false;
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(2.0_f32, theme::BORDER_DIM))
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.set_min_width(240.0);
+            ui.label(
+                egui::RichText::new(title)
+                    .font(theme::mono_font(13.5))
+                    .color(theme::PAPER),
+            );
+            ui.add_space(4.0);
+            ui.label(theme::micro_label(body, theme::ghost_text()));
+            ui.add_space(10.0);
+            if theme::brutal_button(ui, button, variant) {
+                clicked = true;
+            }
+        });
+    clicked
 }
 
 /// Near-square column count: 1x1, 1x2, 2x2, 2x3, 3x3, 3x4, 4x4… (smallest
