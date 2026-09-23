@@ -77,7 +77,11 @@ UX pass published at https://claude.ai/artifact/4RHTdmE23w8tzbB9FyZ5GS; user ask
 - All native reviews closed with approved, acknowledged receipts (T1-T3 range); T4 not yet reviewed — RDD status was not re-checked before this commit.
 - `cargo test` at `b9850dd`: 143 lib + 6 + 1 passed, 1 ignored. Clippy clean, rustfmt clean on touched files.
 
+## Release
+- `feat/entry-ux` fast-forwarded onto `main`; `fb43ed5 chore(release): bump version to 0.10.0` pushed to `origin/main`.
+- Annotated tag `v0.10.0` pushed; GitHub Release https://github.com/edoriban/cam-viewer/releases/tag/v0.10.0 with Linux and Windows x86_64 artifacts.
+- Delivered directly to `main` at the user's request instead of the planned stacked PRs. T4 review (`under_budget`) was not run before delivery.
+- v0.10.0 installed locally at `~/.local/bin/cam-viewer`.
+
 ## Next step
-1. T4 assessed (medium, under_budget); review stays pending in the slice until the PR is prepared or the budget is reached.
-2. Slice PRs per `stacked-to-main` (T1 = `c7bfb27`; T2 = `a1858c0`; T3 = `7d2b6ea` + `ca21665`; T4 = `b9850dd`) — push/PR is the user's decision.
-3. Optional follow-ups: the advisory findings above.
+Release complete. Optional follow-ups: the advisory findings above, and making DISCOVER visually primary on the welcome view.
