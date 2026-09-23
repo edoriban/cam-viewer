@@ -32,11 +32,13 @@ UX pass published at https://claude.ai/artifact/4RHTdmE23w8tzbB9FyZ5GS; user ask
   - Correction `ca21665` (review R3-online-on-spawn): status stays Connecting until the first frame of each attempt; `has_frame` resets per attempt. The "stream open" phase is not observable (streaming ffmpeg stderr is discarded), so the band no longer claims it from a spawn. `cargo test` 135 lib + 6 + 1 passed, 1 ignored.
   - Superseded deviation: the "reach" phase ends as soon as the ffmpeg child process spawns (not once RTSP negotiation succeeds) since ffmpeg's stderr is discarded and not parsed for progress; the "reach" segment is near-instant and "stream" covers most of the real wait. Documented in the commit body.
 
+- [ ] T4 — Fix defects found in runtime visual check (Xvfb, 1280x720, 2026-09-23): (a) welcome option cards overflow horizontally — second card clipped past the window edge; (b) tile phase band label/elapsed time collide with the bottom-right CONNECTING badge; (c) offline message repeats the camera name already shown in the tile corner. Pre-existing on main, out of scope: mute chip overlaps the camera name top-left; grid tiles use only ~half the width.
+
 ## Acceptance criteria
-- [x] Parse error → file bytes unchanged until user saves; saving keeps the original as `.bak` (unit-tested). Banner visibility: not verified at runtime.
+- [x] Parse error → file bytes unchanged until user saves; saving keeps the original as `.bak` (unit-tested). Banner verified at runtime (Xvfb screenshot); file bytes unchanged after launch.
 - [ ] RELOAD re-reads the config without restarting (implemented; no test, not verified at runtime).
-- [x] Zero cameras at launch → Grid with the shared welcome view (initial_view unit-tested). Visual: not verified at runtime.
-- [x] Attempt count, retry deadline and retry_now wake unit-tested. Tile rendering: not verified at runtime.
+- [x] Zero cameras at launch → Grid with the shared welcome view (initial_view unit-tested). Visual: renders, but cards overflow at 1280 px (T4a).
+- [x] Attempt count, retry deadline and retry_now wake unit-tested. Tile rendering verified at runtime (attempt, countdown, RETRY NOW visible); band/badge collision (T4b).
 - [x] Connecting vs. no-frame fallback distinct in `tile_band` (unit-tested); "stream open" intentionally not claimed without evidence.
 - [x] Sidebar header reports online/connecting/offline counts (`sidebar_summary` unit-tested).
 - [x] `cargo test` passes (135 lib + 6 + 1, 1 ignored); `cargo clippy --all-targets -- -D warnings` clean.
@@ -70,6 +72,6 @@ UX pass published at https://claude.ai/artifact/4RHTdmE23w8tzbB9FyZ5GS; user ask
 - `cargo test` at `ca21665`: 135 lib + 6 + 1 passed, 1 ignored. Clippy clean.
 
 ## Next step
-1. Run the app once to visually verify the banner, welcome view, phase band and offline tile (never verified at runtime).
+1. T4: fix the three visual defects found at runtime, then re-shoot.
 2. Slice PRs per `stacked-to-main` (T1 = `c7bfb27`; T2 = `a1858c0`; T3 = `7d2b6ea` + `ca21665`) — push/PR is the user's decision.
 3. Optional follow-ups: the advisory findings above.
