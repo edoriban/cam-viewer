@@ -19,6 +19,12 @@ const REPAINT_INTERVAL: Duration = Duration::from_millis(50);
 const SIDEBAR_WIDTH: f32 = 236.0;
 const GRID_MIN_TILE_WIDTH: f32 = 360.0;
 const GRID_SPACING: f32 = 12.0;
+/// Narrowest a welcome option block is allowed to get before the pair
+/// stacks vertically instead of sitting side by side (T4a).
+const WELCOME_OPTION_MIN_WIDTH: f32 = 300.0;
+const WELCOME_OPTION_GAP: f32 = 16.0;
+const WELCOME_OPTION_INNER_MARGIN: f32 = 14.0;
+const WELCOME_OPTION_BORDER: f32 = 2.0;
 
 enum View {
     Grid,
@@ -1802,10 +1808,12 @@ fn welcome_view(ui: &mut egui::Ui) -> GridAction {
     );
     ui.add_space(18.0);
 
-    let narrow = ui.available_width() < 520.0;
-    if narrow {
+    let available = ui.available_width();
+    if welcome_options_stack(available) {
+        let width = available.max(WELCOME_OPTION_MIN_WIDTH);
         if welcome_option(
             ui,
+            width,
             "Scan this network",
             "Finds ONVIF and RTSP cameras on your network interfaces.",
             "DISCOVER",
@@ -1816,6 +1824,7 @@ fn welcome_view(ui: &mut egui::Ui) -> GridAction {
         ui.add_space(10.0);
         if welcome_option(
             ui,
+            width,
             "I have a URL",
             "Paste an rtsp:// address, e.g. rtsp://192.168.1.20/stream1",
             "+ ADD CAMERA",
@@ -1824,9 +1833,11 @@ fn welcome_view(ui: &mut egui::Ui) -> GridAction {
             action = GridAction::GoToSettings;
         }
     } else {
+        let width = ((available - WELCOME_OPTION_GAP) / 2.0).max(WELCOME_OPTION_MIN_WIDTH);
         ui.horizontal(|ui| {
             if welcome_option(
                 ui,
+                width,
                 "Scan this network",
                 "Finds ONVIF and RTSP cameras on your network interfaces.",
                 "DISCOVER",
@@ -1834,9 +1845,10 @@ fn welcome_view(ui: &mut egui::Ui) -> GridAction {
             ) {
                 action = GridAction::GoToDiscover;
             }
-            ui.add_space(16.0);
+            ui.add_space(WELCOME_OPTION_GAP);
             if welcome_option(
                 ui,
+                width,
                 "I have a URL",
                 "Paste an rtsp:// address, e.g. rtsp://192.168.1.20/stream1",
                 "+ ADD CAMERA",
@@ -1849,31 +1861,58 @@ fn welcome_view(ui: &mut egui::Ui) -> GridAction {
     action
 }
 
-/// One bordered welcome option block (title, body, action button).
+/// Whether the two welcome option blocks must stack vertically instead of
+/// sitting side by side (T4a): true unless `available_width` fits both at
+/// `WELCOME_OPTION_MIN_WIDTH` with a gap between them. Before this, the two
+/// blocks sat side by side unconditionally at any width, so at 1280x720 the
+/// second block ran past the window edge with clipped text.
+fn welcome_options_stack(available_width: f32) -> bool {
+    available_width < 2.0 * WELCOME_OPTION_MIN_WIDTH + WELCOME_OPTION_GAP
+}
+
+/// One bordered welcome option block: title, then a wrapped description,
+/// then the action button, always stacked vertically. Before T4a this
+/// inherited the enclosing row's horizontal layout when called from
+/// `ui.horizontal`, so title/description/button rendered as a single
+/// horizontal line and the description text clipped instead of wrapping.
+/// The frame's inner content ui must claim less than the block's intended
+/// outer `width`, since the frame adds its own margin and border on both
+/// sides on top of whatever the content ui claims (T4a correction — an
+/// unshrunk content width made each block ~32px wider than its slot,
+/// overflowing the window again despite the stacked/side-by-side decision
+/// itself being correct).
+fn welcome_option_content_width(width: f32) -> f32 {
+    (width - 2.0 * (WELCOME_OPTION_INNER_MARGIN + WELCOME_OPTION_BORDER)).max(0.0)
+}
+
 fn welcome_option(
     ui: &mut egui::Ui,
+    width: f32,
     title: &str,
     body: &str,
     button: &str,
     variant: BtnVariant,
 ) -> bool {
     let mut clicked = false;
+    let content_width = welcome_option_content_width(width);
     egui::Frame::new()
-        .stroke(egui::Stroke::new(2.0_f32, theme::BORDER_DIM))
-        .inner_margin(egui::Margin::same(14))
+        .stroke(egui::Stroke::new(WELCOME_OPTION_BORDER, theme::BORDER_DIM))
+        .inner_margin(egui::Margin::same(WELCOME_OPTION_INNER_MARGIN as i8))
         .show(ui, |ui| {
-            ui.set_min_width(240.0);
-            ui.label(
-                egui::RichText::new(title)
-                    .font(theme::mono_font(13.5))
-                    .color(theme::PAPER),
-            );
-            ui.add_space(4.0);
-            ui.label(theme::micro_label(body, theme::ghost_text()));
-            ui.add_space(10.0);
-            if theme::brutal_button(ui, button, variant) {
-                clicked = true;
-            }
+            ui.set_width(content_width);
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .font(theme::mono_font(13.5))
+                        .color(theme::PAPER),
+                );
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(theme::micro_label(body, theme::ghost_text())).wrap());
+                ui.add_space(10.0);
+                if theme::brutal_button(ui, button, variant) {
+                    clicked = true;
+                }
+            });
         });
     clicked
 }
@@ -1965,6 +2004,15 @@ fn video_surface(
     };
     theme::draw_chip(&painter, mute_rect, mute_text, mute_fg, theme::SOOT_2);
 
+    // Measured up front (T4b) so the phase band below can reserve this area
+    // instead of colliding with the badge drawn later, in the `overlays`
+    // block; `None` when no badge will be drawn at all.
+    let badge_rect_for_band = overlays.then(|| {
+        let (badge_status, badge_label) =
+            badge_display(cam.stream.status(), cam.stream.has_frame());
+        theme::badge_rect(&painter, rect, badge_status, badge_position, badge_label)
+    });
+
     match cam.stream.latest_frame() {
         Some(frame) => {
             let tex = ensure_texture(ui.ctx(), cam, &frame);
@@ -1996,7 +2044,7 @@ fn video_surface(
                             theme::ghost_text(),
                         );
                         let elapsed = cam.stream.phase_started_at().elapsed();
-                        phase_band(&painter, rect, band, elapsed);
+                        phase_band(&painter, rect, band, elapsed, badge_rect_for_band);
                     }
                 }
             }
@@ -2048,17 +2096,46 @@ fn video_surface(
     response.clicked()
 }
 
+/// Default height of the bottom-of-tile phase band.
+const PHASE_BAND_HEIGHT: f32 = 22.0;
+/// Minimum gap kept between the phase band and a badge it moved to avoid.
+const PHASE_BAND_BADGE_CLEARANCE: f32 = 4.0;
+
+/// Rect for the bottom-of-tile phase band, moved up clear of `badge_rect`
+/// when it would otherwise overlap the band's default bottom strip (T4b —
+/// the band's label/elapsed row used to collide with a bottom-right corner
+/// badge). A `TopRight` badge, or no badge at all, never overlaps the
+/// default strip, so the band keeps its usual bottom placement.
+fn band_rect(tile: egui::Rect, badge_rect: Option<egui::Rect>) -> egui::Rect {
+    let default_top = tile.bottom() - PHASE_BAND_HEIGHT;
+    let mut bottom = tile.bottom();
+    if let Some(badge) = badge_rect
+        && badge.top() < tile.bottom()
+        && badge.bottom() > default_top
+    {
+        bottom = (badge.top() - PHASE_BAND_BADGE_CLEARANCE).min(tile.bottom());
+    }
+    let top = (bottom - PHASE_BAND_HEIGHT).max(tile.top());
+    egui::Rect::from_min_max(
+        egui::pos2(tile.left(), top),
+        egui::pos2(tile.right(), bottom),
+    )
+}
+
 /// Bottom-of-tile phase band drawn while a stream is Connecting or Online
 /// without a frame yet (T3): "reach · stream · live" segments (only two are
 /// ever drawn as distinct here, since "live" is implied by the band no
 /// longer showing at all once a frame arrives), current segment
 /// STATUS_CONNECTING, done segments STATUS_ONLINE, pending BORDER_DIM.
-fn phase_band(painter: &egui::Painter, rect: egui::Rect, band: TileBand, elapsed: Duration) {
-    let height = 22.0;
-    let band_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left(), rect.bottom() - height),
-        rect.right_bottom(),
-    );
+/// `badge_rect` reserves the corner status badge's area (T4b).
+fn phase_band(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    band: TileBand,
+    elapsed: Duration,
+    badge_rect: Option<egui::Rect>,
+) {
+    let band_rect = band_rect(rect, badge_rect);
     painter.rect_filled(band_rect, 0.0, theme::SOOT_2);
 
     let current = band.current_segment();
@@ -2095,6 +2172,24 @@ fn phase_band(painter: &egui::Painter, rect: egui::Rect, band: TileBand, elapsed
     );
 }
 
+/// Headline for the offline tile (T4c): attempt count only. The camera name
+/// is not repeated here since it is already shown in the tile's corner
+/// overlay.
+fn offline_headline(attempts: u32) -> String {
+    format!("NO RESPONSE \u{b7} ATTEMPT {attempts}")
+}
+
+/// Seconds to show for "next try in _s" (T4c): rounded UP so a sub-second
+/// remainder (e.g. 0.3s) still reads as "1s", and never shown as "0s" while
+/// a retry is actually pending — only a genuinely absent deadline (`None`)
+/// reads as 0.
+fn offline_countdown_seconds(remaining: Option<Duration>) -> u64 {
+    match remaining {
+        None => 0,
+        Some(remaining) => (remaining.as_secs_f64().ceil() as u64).max(1),
+    }
+}
+
 /// Full-tile Offline message (T3): attempt count, countdown to the next
 /// retry, and a RETRY NOW control that calls `StreamHandle::retry_now`.
 fn offline_tile(ui: &mut egui::Ui, rect: egui::Rect, cam: &CameraView, surface_id: egui::Id) {
@@ -2103,22 +2198,19 @@ fn offline_tile(ui: &mut egui::Ui, rect: egui::Rect, cam: &CameraView, surface_i
     painter.text(
         rect.center() + egui::vec2(0.0, -18.0),
         egui::Align2::CENTER_CENTER,
-        format!("{}: NO RESPONSE \u{b7} ATTEMPT {attempts}", cam.name),
+        offline_headline(attempts),
         theme::mono_font(12.0),
         theme::ghost_text(),
     );
     let remaining = cam
         .stream
         .next_retry_at()
-        .map(|at| {
-            at.saturating_duration_since(std::time::Instant::now())
-                .as_secs()
-        })
-        .unwrap_or(0);
+        .map(|at| at.saturating_duration_since(std::time::Instant::now()));
+    let countdown = offline_countdown_seconds(remaining);
     painter.text(
         rect.center() + egui::vec2(0.0, 2.0),
         egui::Align2::CENTER_CENTER,
-        format!("next try in {remaining}s"),
+        format!("next try in {countdown}s"),
         theme::mono_font(10.0),
         theme::ghost_text(),
     );
@@ -3538,5 +3630,108 @@ mod tests {
             // Navigation itself stays untouched; only the wizard ends.
             assert!(!matches!(app.view, View::Discover));
         }
+    }
+
+    // -- T4a: welcome options must not overflow their bounds -----------------
+
+    #[test]
+    fn welcome_options_stack_when_the_window_is_too_narrow_for_two_side_by_side() {
+        // A 1280x720 window minus the sidebar leaves well under 2*300+16 px;
+        // this used to sit the two option blocks side by side unconditionally
+        // and clip the second one past the window edge.
+        assert!(welcome_options_stack(500.0));
+        assert!(welcome_options_stack(
+            2.0 * WELCOME_OPTION_MIN_WIDTH + WELCOME_OPTION_GAP - 0.1
+        ));
+    }
+
+    #[test]
+    fn welcome_options_sit_side_by_side_once_both_fit_at_the_minimum_width() {
+        assert!(!welcome_options_stack(
+            2.0 * WELCOME_OPTION_MIN_WIDTH + WELCOME_OPTION_GAP
+        ));
+        assert!(!welcome_options_stack(900.0));
+    }
+
+    #[test]
+    fn welcome_option_content_width_leaves_room_for_the_frames_own_margin_and_border() {
+        // Regression for a correction found in runtime verification: the
+        // Frame adds its inner margin and stroke width on both sides on top
+        // of whatever the content ui claims, so passing the outer `width`
+        // straight through made each rendered block ~32px wider than its
+        // allotted slot and the second block still overflowed the window.
+        let overhead = 2.0 * (WELCOME_OPTION_INNER_MARGIN + WELCOME_OPTION_BORDER);
+        assert_eq!(welcome_option_content_width(496.0), 496.0 - overhead);
+        assert_eq!(welcome_option_content_width(0.0), 0.0);
+
+        // Two side-by-side blocks, each shrunk this way, must fit exactly
+        // within an available width they were sized from.
+        let available = 1008.0_f32;
+        let width = ((available - WELCOME_OPTION_GAP) / 2.0).max(WELCOME_OPTION_MIN_WIDTH);
+        let rendered_block_width = welcome_option_content_width(width) + overhead;
+        assert!(2.0 * rendered_block_width + WELCOME_OPTION_GAP <= available + 0.001);
+    }
+
+    // -- T4b: tile phase band must not collide with the corner badge --------
+
+    #[test]
+    fn band_rect_moves_above_a_bottom_right_badge_that_would_overlap_it() {
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 150.0));
+        // A bottom-right badge whose top edge sits inside the default
+        // bottom-22px band strip.
+        let badge = egui::Rect::from_min_size(egui::pos2(150.0, 130.0), egui::vec2(40.0, 16.0));
+
+        let band = band_rect(tile, Some(badge));
+
+        assert!(
+            band.bottom() <= badge.top() - 3.9,
+            "band must end above the badge with clearance, got {band:?} vs badge {badge:?}"
+        );
+        assert!(
+            band.top() < band.bottom(),
+            "band must keep a positive height"
+        );
+    }
+
+    #[test]
+    fn band_rect_keeps_the_default_bottom_placement_for_a_top_right_badge() {
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 150.0));
+        // A top-right badge never overlaps the bottom band strip.
+        let badge = egui::Rect::from_min_size(egui::pos2(150.0, 10.0), egui::vec2(40.0, 16.0));
+
+        let band = band_rect(tile, Some(badge));
+
+        assert_eq!(band.bottom(), tile.bottom());
+    }
+
+    #[test]
+    fn band_rect_keeps_the_default_bottom_placement_without_a_badge() {
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 150.0));
+        assert_eq!(band_rect(tile, None).bottom(), tile.bottom());
+    }
+
+    // -- T4c: offline message must not repeat the on-tile camera name, and --
+    // -- its countdown must round up instead of ever showing a stale 0s. ----
+
+    #[test]
+    fn offline_headline_has_no_camera_name() {
+        let headline = offline_headline(4);
+        assert_eq!(headline, "NO RESPONSE \u{b7} ATTEMPT 4");
+        assert!(!headline.contains("Front"));
+    }
+
+    #[test]
+    fn offline_countdown_rounds_up_and_never_shows_zero_while_pending() {
+        assert_eq!(offline_countdown_seconds(None), 0);
+        assert_eq!(
+            offline_countdown_seconds(Some(Duration::from_millis(300))),
+            1
+        );
+        assert_eq!(offline_countdown_seconds(Some(Duration::ZERO)), 1);
+        assert_eq!(offline_countdown_seconds(Some(Duration::from_secs(5))), 5);
+        assert_eq!(
+            offline_countdown_seconds(Some(Duration::from_millis(5500))),
+            6
+        );
     }
 }

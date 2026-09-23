@@ -324,6 +324,32 @@ pub fn nav_item(ui: &mut egui::Ui, label: &str, count: Option<String>, active: b
 /// lets a caller show different text than `status.label()` while keeping the
 /// color that `status` implies (used by T3 to show "STARTING" in the
 /// STATUS_CONNECTING color for a stream that is Online but has no frame yet).
+/// Geometry of the tile's corner status badge, without drawing it. Exposed
+/// so callers (T4b: the tile phase band) can reserve this area instead of
+/// drawing under it.
+pub fn badge_rect(
+    painter: &egui::Painter,
+    tile: egui::Rect,
+    status: Status,
+    position: BadgePosition,
+    label_override: Option<&str>,
+) -> egui::Rect {
+    let text = label_override
+        .unwrap_or_else(|| status.label())
+        .to_uppercase();
+    let galley = painter.layout_no_wrap(text, mono_font(9.0), PAPER);
+    let size = galley.size() + egui::vec2(14.0, 8.0);
+    let inset = 10.0;
+    let min = match position {
+        BadgePosition::TopRight => egui::pos2(tile.right() - inset - size.x, tile.top() + inset),
+        BadgePosition::BottomRight => egui::pos2(
+            tile.right() - inset - size.x,
+            tile.bottom() - inset - size.y,
+        ),
+    };
+    egui::Rect::from_min_size(min, size)
+}
+
 pub fn status_badge(
     painter: &egui::Painter,
     tile: egui::Rect,
@@ -338,17 +364,8 @@ pub fn status_badge(
         Status::Online | Status::Connecting => SOOT,
         Status::Offline | Status::Paused => PAPER,
     };
+    let rect = badge_rect(painter, tile, status, position, label_override);
     let galley = painter.layout_no_wrap(text, mono_font(9.0), text_color);
-    let size = galley.size() + egui::vec2(14.0, 8.0);
-    let inset = 10.0;
-    let min = match position {
-        BadgePosition::TopRight => egui::pos2(tile.right() - inset - size.x, tile.top() + inset),
-        BadgePosition::BottomRight => egui::pos2(
-            tile.right() - inset - size.x,
-            tile.bottom() - inset - size.y,
-        ),
-    };
-    let rect = egui::Rect::from_min_size(min, size);
     painter.rect_filled(rect, 0.0, status_color(status));
     painter.rect_stroke(
         rect,
