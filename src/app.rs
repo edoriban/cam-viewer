@@ -2230,6 +2230,11 @@ impl TileBand {
     }
 }
 
+/// `Status::Connecting` covers the whole reconnect attempt now (reaching the
+/// camera and, once ffmpeg has spawned, waiting for its first frame), since
+/// `stream::run_loop` no longer promotes status to `Online` on spawn alone
+/// (R3-online-on-spawn). The `Online`-without-a-frame arm is kept only as a
+/// defensive fallback and should not normally be reached in practice.
 fn tile_band(status: Status, has_frame: bool) -> Option<TileBand> {
     match status {
         Status::Connecting => Some(TileBand::Reaching),
@@ -3282,6 +3287,25 @@ mod tests {
             (Status::Offline, None)
         );
         assert_eq!(badge_display(Status::Paused, false), (Status::Paused, None));
+    }
+
+    #[test]
+    fn a_reconnecting_camera_with_a_stale_frame_reports_connecting_not_online() {
+        // R3-online-on-spawn: `begin_attempt` resets status to Connecting on
+        // every reconnect attempt and clears `has_frame`, so a frame
+        // published by a *previous* attempt must not make the badge or the
+        // sidebar tally report ONLINE while this attempt is still reaching.
+        assert_eq!(
+            badge_display(Status::Connecting, true),
+            (Status::Connecting, None),
+            "a stale has_frame must not make a reconnecting camera's badge ONLINE"
+        );
+        let tally = StatusCounts::tally([Status::Connecting]);
+        assert_eq!(
+            tally.online, 0,
+            "a reconnecting camera must not count as online"
+        );
+        assert_eq!(tally.connecting, 1);
     }
 
     fn counts(online: usize, connecting: usize, offline: usize, paused: usize) -> StatusCounts {

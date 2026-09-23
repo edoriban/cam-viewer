@@ -69,8 +69,10 @@ struct Shared {
     /// Start time of the current phase (a reconnect attempt, or the stream
     /// being open with no frame yet), used to render elapsed time in tiles.
     phase_started: Arc<Mutex<Instant>>,
-    /// Set once this stream has ever published a frame; never cleared, since
-    /// the last frame is kept forever once published (see `read_frames`).
+    /// Set once `read_frames` has published a frame during the current
+    /// attempt; cleared by `begin_attempt` so a stale frame from a previous
+    /// attempt never makes a fresh reconnect look reachable (the texture
+    /// itself is still kept, see `read_frames`).
     has_frame: Arc<AtomicBool>,
     /// Set by `StreamHandle::retry_now` to wake an in-progress backoff sleep
     /// immediately; consumed (cleared) by `sleep_interruptible` itself.
@@ -314,14 +316,17 @@ fn sleep_interruptible(
 }
 
 /// Runs immediately before each reconnect attempt (T3): bumps the attempt
-/// count, clears any stale retry deadline, and resets the phase clock so
-/// tiles can render "elapsed since this attempt began". Kept as its own
-/// function so the accounting is unit-testable without spawning ffmpeg.
+/// count, clears any stale retry deadline, resets the phase clock so tiles
+/// can render "elapsed since this attempt began", and clears `has_frame` so
+/// a frame published by a previous attempt never makes this new attempt
+/// look reachable before it proves so. Kept as its own function so the
+/// accounting is unit-testable without spawning ffmpeg.
 fn begin_attempt(shared: &Shared) {
     shared.attempts.fetch_add(1, Ordering::Relaxed);
     *lock(&shared.next_retry) = None;
     *lock(&shared.phase_started) = Instant::now();
     *lock(&shared.status) = Status::Connecting;
+    shared.has_frame.store(false, Ordering::Relaxed);
 }
 
 /// Runs after a failed attempt (spawn failure or the stream ending): moves
@@ -329,6 +334,19 @@ fn begin_attempt(shared: &Shared) {
 /// interruptibly by shutdown, pause, or `StreamHandle::retry_now`. `delay`
 /// is a parameter (rather than reading `RECONNECT_DELAY` directly) so tests
 /// can exercise this with a short, deterministic duration.
+/// Runs once ffmpeg's process has spawned (R3 correction): a spawned
+/// process only proves the local ffmpeg binary launched, not that the
+/// camera itself is reachable, so status is deliberately left as
+/// `Connecting` (set by `begin_attempt`) until `read_frames` publishes the
+/// first frame of this attempt. `tile_band`'s Online-without-a-frame branch
+/// is kept only as a defensive fallback and should no longer be reached in
+/// practice. Kept as its own function, even though it currently does
+/// nothing, so a regression here (re-promoting status to `Online`) fails a
+/// fast unit test instead of only showing up against a real camera.
+fn on_process_spawned(shared: &Shared) {
+    let _ = shared;
+}
+
 fn enter_backoff(shared: &Shared, delay: Duration) {
     *lock(&shared.status) = Status::Offline;
     *lock(&shared.next_retry) = Some(Instant::now() + delay);
@@ -511,12 +529,7 @@ fn run_loop(shared: Shared, url: &str) {
             }
         };
 
-        // Process spawned: the "reach" phase is done, so the "stream open,
-        // no frame yet" phase (T3) starts now. Externally this is still
-        // Status::Online (app.rs distinguishes "no frame yet" via
-        // `has_frame`), so nothing downstream of `status()` needs to change.
-        *lock(&shared.phase_started) = Instant::now();
-        *lock(&shared.status) = Status::Online;
+        on_process_spawned(&shared);
 
         let mut stdout = child.stdout.take();
         *lock(&shared.child) = Some(child);
@@ -744,8 +757,8 @@ fn read_frames<R: Read>(shared: &Shared, reader: R) {
 #[cfg(test)]
 mod ppm_tests {
     use super::{
-        MAX_FRAME_BYTES, Shared, Status, StreamHandle, begin_attempt, enter_backoff, read_frames,
-        read_ppm_header, sleep_interruptible,
+        MAX_FRAME_BYTES, Shared, Status, StreamHandle, begin_attempt, enter_backoff,
+        on_process_spawned, read_frames, read_ppm_header, sleep_interruptible,
     };
     use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -952,6 +965,38 @@ mod ppm_tests {
             shared.attempts.load(Ordering::Relaxed),
             2,
             "each failed attempt keeps counting up"
+        );
+    }
+
+    #[test]
+    fn spawning_the_process_does_not_promote_status_to_online() {
+        // R3-online-on-spawn: a spawned ffmpeg process only proves the local
+        // binary launched, not that the camera is reachable. Status must
+        // stay Connecting (as `begin_attempt` set it) until a frame arrives.
+        let shared = test_shared();
+        begin_attempt(&shared);
+
+        on_process_spawned(&shared);
+
+        assert_eq!(
+            *shared.status.lock().expect("lock"),
+            Status::Connecting,
+            "spawn alone must not promote status to Online"
+        );
+    }
+
+    #[test]
+    fn begin_attempt_clears_has_frame_from_a_previous_attempt() {
+        // R3-online-on-spawn: a frame published by a prior attempt must not
+        // make the next reconnect attempt look reachable before it proves so.
+        let shared = test_shared();
+        shared.has_frame.store(true, Ordering::Relaxed);
+
+        begin_attempt(&shared);
+
+        assert!(
+            !shared.has_frame.load(Ordering::Relaxed),
+            "has_frame must reset at the start of a new attempt"
         );
     }
 

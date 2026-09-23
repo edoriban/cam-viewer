@@ -72,6 +72,7 @@ then follow only its `next_transition` (targeted validator → approval → exac
 - Branch `feat/entry-ux` from `main` @ 8c9cb8b. Commits: `c7bfb27` (T1), `a1858c0` (T2), `7d2b6ea` (T3), `59f295c` (docs).
 - `cargo test` at `59f295c`: 132 lib + 6 + 1 passed, 1 ignored (baseline 120/1). Clippy clean.
 - Paused by the user on 2026-09-22 before the correction was written; working tree clean.
+- Correction for R3-online-on-spawn committed (see this commit); review resume pending.
 
 ## Next step
 1. Implement the R3-online-on-spawn correction (above) with TDD and commit it.
