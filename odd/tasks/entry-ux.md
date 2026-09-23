@@ -66,7 +66,7 @@ then follow only its `next_transition` (targeted validator → approval → exac
 
 ## Environment notes
 - `.codegraph/` added to `.git/info/exclude` (local only) so review inventory has no untracked files.
-- Engram mirror `odd/entry-ux/tasks`: **pending** — save failed (multiple active sessions match the project).
+- Engram mirror `odd/entry-ux/tasks`: saved via CLI as #2560 (MCP save failed: multiple active sessions).
 
 ## Progress
 - Branch `feat/entry-ux` from `main` @ 8c9cb8b. Commits: `c7bfb27` (T1), `a1858c0` (T2), `7d2b6ea` (T3), `59f295c` (docs).
@@ -78,4 +78,4 @@ then follow only its `next_transition` (targeted validator → approval → exac
 2. Re-run the exact review status above and finish the review (validator → acknowledge).
 3. Run the app once to visually verify the banner, welcome view, phase band and offline tile (never verified at runtime).
 4. Tick acceptance criteria; then slice PRs per `stacked-to-main` (T1, T2, T3) — push/PR is the user's decision.
-5. Retry the Engram mirror.
+5. Keep the Engram mirror (#2560, topic `odd/entry-ux/tasks`) in sync.
