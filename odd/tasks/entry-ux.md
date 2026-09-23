@@ -32,16 +32,21 @@ UX pass published at https://claude.ai/artifact/4RHTdmE23w8tzbB9FyZ5GS; user ask
   - Correction `ca21665` (review R3-online-on-spawn): status stays Connecting until the first frame of each attempt; `has_frame` resets per attempt. The "stream open" phase is not observable (streaming ffmpeg stderr is discarded), so the band no longer claims it from a spawn. `cargo test` 135 lib + 6 + 1 passed, 1 ignored.
   - Superseded deviation: the "reach" phase ends as soon as the ffmpeg child process spawns (not once RTSP negotiation succeeds) since ffmpeg's stderr is discarded and not parsed for progress; the "reach" segment is near-instant and "stream" covers most of the real wait. Documented in the commit body.
 
-- [ ] T4 — Fix defects found in runtime visual check (Xvfb, 1280x720, 2026-09-23): (a) welcome option cards overflow horizontally — second card clipped past the window edge; (b) tile phase band label/elapsed time collide with the bottom-right CONNECTING badge; (c) offline message repeats the camera name already shown in the tile corner. Pre-existing on main, out of scope: mute chip overlaps the camera name top-left; grid tiles use only ~half the width.
+- [x] T4 — Fix defects found in runtime visual check (Xvfb, 1280x720, 2026-09-23): (a) welcome option cards overflow horizontally — second card clipped past the window edge; (b) tile phase band label/elapsed time collide with the bottom-right CONNECTING badge; (c) offline message repeats the camera name already shown in the tile corner. Pre-existing on main, out of scope: mute chip overlaps the camera name top-left; grid tiles use only ~half the width. Route: direct (writer trigger fired: app.rs + theme.rs, 2 non-trivial files).
+  - Commit `b9850dd`. TDD: RED confirmed first (new `welcome_options_stack`/`welcome_option_content_width`, `band_rect`, `offline_headline`/`offline_countdown_seconds` referenced by tests before existing — compile failure), then GREEN. `cargo test` 143 lib passed (135 + 8 new) + 6 discovery_scan + 1 ffmpeg_pipe, 1 live_probe ignored. `cargo clippy --all-targets -- -D warnings` clean. `rustfmt --edition 2024 --check src/app.rs src/theme.rs` clean.
+  - (a) welcome options: `welcome_option` now lays out vertically inside `ui.vertical` (title, wrapped description, button) instead of inheriting the enclosing row's horizontal layout; `welcome_options_stack` decides side-by-side vs. stacked from available width (min 300px per block); `welcome_option_content_width` shrinks the frame's content ui by its own margin/border so the rendered block matches its allotted slot (a first pass without this still overflowed the window by ~32px per block — caught by re-screenshotting, corrected before commit).
+  - (b) tile band vs. badge: `theme::badge_rect` extracted from `status_badge` so `video_surface` can measure the corner badge up front; `band_rect` (pure, tested) moves the phase band above the badge's rect when it would overlap the default bottom strip (BottomRight), and leaves TopRight/no-badge placement unchanged.
+  - (c) offline message: `offline_headline` drops the camera name (already shown in the tile's corner overlay); `offline_countdown_seconds` rounds the remaining time up and never shows "0s" while a retry is pending (only a genuinely absent deadline reads as 0).
+  - Runtime verified via Xvfb screenshots at 1280x720 (`t4-first.png`, `t4-cams-1.png`, `t4-cams-2.png`) and 900x700 (`t4-first-narrow.png`): both welcome cards fully visible with wrapped description at both widths (pixel-checked: second card's right border ends inside the 1280px window, background resumes after); offline tile reads "NO RESPONSE · ATTEMPT N" with no camera name and a countdown that reached "next try in 1s" (never 0s) while pending; CONNECTING tile's phase band ("CONNECTING" label + elapsed, e.g. "6S") sits above the bottom-right CONNECTING badge with no overlap.
 
 ## Acceptance criteria
 - [x] Parse error → file bytes unchanged until user saves; saving keeps the original as `.bak` (unit-tested). Banner verified at runtime (Xvfb screenshot); file bytes unchanged after launch.
 - [ ] RELOAD re-reads the config without restarting (implemented; no test, not verified at runtime).
-- [x] Zero cameras at launch → Grid with the shared welcome view (initial_view unit-tested). Visual: renders, but cards overflow at 1280 px (T4a).
-- [x] Attempt count, retry deadline and retry_now wake unit-tested. Tile rendering verified at runtime (attempt, countdown, RETRY NOW visible); band/badge collision (T4b).
+- [x] Zero cameras at launch → Grid with the shared welcome view (initial_view unit-tested). Visual: renders, both option cards fully inside the window at 1280x720 and 900x700 (T4a fixed).
+- [x] Attempt count, retry deadline and retry_now wake unit-tested. Tile rendering verified at runtime (attempt, countdown, RETRY NOW visible); band/badge no longer collide (T4b fixed).
 - [x] Connecting vs. no-frame fallback distinct in `tile_band` (unit-tested); "stream open" intentionally not claimed without evidence.
 - [x] Sidebar header reports online/connecting/offline counts (`sidebar_summary` unit-tested).
-- [x] `cargo test` passes (135 lib + 6 + 1, 1 ignored); `cargo clippy --all-targets -- -D warnings` clean.
+- [x] `cargo test` passes (143 lib + 6 + 1, 1 ignored); `cargo clippy --all-targets -- -D warnings` clean.
 
 ## Delivery
 - Forecast: ~500–650 authored changed lines (> 400 budget). Strategy: ask-on-risk → chain strategy `stacked-to-main` (user choice).
@@ -67,11 +72,11 @@ UX pass published at https://claude.ai/artifact/4RHTdmE23w8tzbB9FyZ5GS; user ask
 - Engram mirror `odd/entry-ux/tasks`: saved via CLI as #2560 (MCP save failed: multiple active sessions).
 
 ## Progress
-- Branch `feat/entry-ux` from `main` @ 8c9cb8b. Commits: `c7bfb27` (T1), `a1858c0` (T2), `7d2b6ea` (T3), `ca21665` (T3 review correction), plus docs commits.
-- All native reviews closed with approved, acknowledged receipts.
-- `cargo test` at `ca21665`: 135 lib + 6 + 1 passed, 1 ignored. Clippy clean.
+- Branch `feat/entry-ux` from `main` @ 8c9cb8b. Commits: `c7bfb27` (T1), `a1858c0` (T2), `7d2b6ea` (T3), `ca21665` (T3 review correction), `b9850dd` (T4), plus docs commits.
+- All native reviews closed with approved, acknowledged receipts (T1-T3 range); T4 not yet reviewed — RDD status was not re-checked before this commit.
+- `cargo test` at `b9850dd`: 143 lib + 6 + 1 passed, 1 ignored. Clippy clean, rustfmt clean on touched files.
 
 ## Next step
-1. T4: fix the three visual defects found at runtime, then re-shoot.
-2. Slice PRs per `stacked-to-main` (T1 = `c7bfb27`; T2 = `a1858c0`; T3 = `7d2b6ea` + `ca21665`) — push/PR is the user's decision.
+1. T4 done; re-run `gentle-ai review assess` on `b9850dd` per the ODD review-due protocol before considering this range delivery-ready.
+2. Slice PRs per `stacked-to-main` (T1 = `c7bfb27`; T2 = `a1858c0`; T3 = `7d2b6ea` + `ca21665`; T4 = `b9850dd`) — push/PR is the user's decision.
 3. Optional follow-ups: the advisory findings above.
