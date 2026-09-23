@@ -87,6 +87,45 @@ pub fn save(path: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Path of the safety copy created before an unreadable `cameras.toml` is
+/// about to be overwritten.
+pub fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    path.with_file_name(name)
+}
+
+/// Copies the file currently at `path` to its `.bak` sibling, byte-for-byte.
+fn backup_existing(path: &Path) -> Result<()> {
+    let bak = backup_path(path);
+    fs::copy(path, &bak)
+        .with_context(|| format!("backing up {} to {}", path.display(), bak.display()))?;
+    Ok(())
+}
+
+/// Save that never silently destroys a config this run could not read.
+///
+/// When `pending_load_error` is true, an existing file at `path` is backed up
+/// to `<path>.bak` first (see [`backup_path`]); if that backup fails, nothing
+/// is written and the error is returned instead — the whole point being that
+/// a save must not overwrite bytes the user might still need to recover by
+/// hand. When `pending_load_error` is false, or there is nothing at `path`
+/// yet, this is exactly [`save`].
+pub fn save_guarded(path: &Path, config: &Config, pending_load_error: bool) -> Result<()> {
+    if pending_load_error && path.exists() {
+        backup_existing(path)?;
+    }
+    save(path, config)
+}
+
+/// Carries a failed startup load into the UI so it can be shown instead of
+/// silently discarded (the previous behavior only `eprintln!`ed it).
+#[derive(Debug, Clone)]
+pub struct ConfigLoadError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
 pub fn load(path: &Path) -> Result<Config> {
     if !path.exists() {
         let default = Config::default();
@@ -193,6 +232,85 @@ mod tests {
         let raw = "[[cameras]]\nname = \"Front\"\nurl = \"rtsp://192.168.1.10/live\"\n";
         let parsed: Config = toml::from_str(raw).expect("parse legacy config");
         assert!(parsed.update_check, "absent key means enabled");
+    }
+
+    #[test]
+    fn a_parse_error_leaves_the_original_file_bytes_untouched() {
+        // The bug this guards: a malformed cameras.toml must never be
+        // rewritten just because it failed to parse on load.
+        let root = std::env::temp_dir().join(format!("cam-viewer-badparse-{}", std::process::id()));
+        let path = root.join(FILE_NAME);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create dir");
+        let original = b"this is not valid toml [[[".to_vec();
+        fs::write(&path, &original).expect("write malformed config");
+
+        assert!(load(&path).is_err(), "malformed config must fail to load");
+        let bytes_after = fs::read(&path).expect("read back");
+        assert_eq!(
+            bytes_after, original,
+            "file must be untouched by a failed load"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_guarded_backs_up_the_original_before_overwriting_a_pending_error() {
+        let root = std::env::temp_dir().join(format!("cam-viewer-guard-{}", std::process::id()));
+        let path = root.join(FILE_NAME);
+        let bak = backup_path(&path);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create dir");
+        let original = b"this is not valid toml [[[".to_vec();
+        fs::write(&path, &original).expect("write malformed config");
+
+        let cfg = sample();
+        save_guarded(&path, &cfg, true).expect("guarded save");
+
+        let backed_up = fs::read(&bak).expect("backup file exists");
+        assert_eq!(backed_up, original, "backup must hold the original bytes");
+        let saved: Config = toml::from_str(&fs::read_to_string(&path).expect("read new content"))
+            .expect("new content parses");
+        assert_eq!(saved, cfg);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_guarded_without_a_pending_error_does_not_create_a_backup() {
+        let root = std::env::temp_dir().join(format!("cam-viewer-noguard-{}", std::process::id()));
+        let path = root.join(FILE_NAME);
+        let bak = backup_path(&path);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create dir");
+        fs::write(&path, "cameras = []\n").expect("write existing config");
+
+        let cfg = sample();
+        save_guarded(&path, &cfg, false).expect("guarded save");
+
+        assert!(!bak.exists(), "no backup expected without a pending error");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_guarded_aborts_without_writing_when_the_backup_copy_fails() {
+        // A directory at `path` can never be copied to `path.bak`, so this
+        // deterministically exercises the backup-failure abort path without
+        // relying on filesystem permissions.
+        let root =
+            std::env::temp_dir().join(format!("cam-viewer-backupfail-{}", std::process::id()));
+        let path = root.join(FILE_NAME);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&path).expect("create dir masquerading as the config path");
+
+        let cfg = sample();
+        let result = save_guarded(&path, &cfg, true);
+        assert!(result.is_err(), "backup failure must abort the save");
+        assert!(path.is_dir(), "the original path must be left untouched");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -1,9 +1,9 @@
-use crate::config::{self, BadgePosition, CameraConfig, Config};
+use crate::config::{self, BadgePosition, CameraConfig, Config, ConfigLoadError};
 use crate::discover::net::{self, InterfaceInfo};
 use crate::discover::probe::DISCOVER_PROBE_TIMEOUT;
 use crate::discover::scan::DEFAULT_PORTS;
 use crate::discover::{
-    RowStatus, DiscoveryConfig, DiscoveryHandle, DiscoveryResult, DiscoverySnapshot, Phase,
+    DiscoveryConfig, DiscoveryHandle, DiscoveryResult, DiscoverySnapshot, Phase, RowStatus,
 };
 use crate::stream::{Status, StreamHandle};
 use crate::theme::{self, BtnVariant};
@@ -824,11 +824,7 @@ impl DiscoverWizard {
     }
 }
 
-fn discover_rows_ui(
-    ui: &mut egui::Ui,
-    rows: &mut [DiscoverRow],
-    preview: &mut Option<Preview>,
-) {
+fn discover_rows_ui(ui: &mut egui::Ui, rows: &mut [DiscoverRow], preview: &mut Option<Preview>) {
     for row in rows {
         discover_row_card(ui, row, preview);
         ui.add_space(8.0);
@@ -1018,7 +1014,10 @@ fn auth_color(auth: RowStatus) -> egui::Color32 {
 fn auth_legend(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         for (color, label) in [
-            (theme::STATUS_ONLINE, "OPEN / AUTHENTICATED \u{2014} ADDABLE"),
+            (
+                theme::STATUS_ONLINE,
+                "OPEN / AUTHENTICATED \u{2014} ADDABLE",
+            ),
             (theme::STATUS_CONNECTING, "NEEDS CREDENTIALS / PATH"),
         ] {
             let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -1027,6 +1026,38 @@ fn auth_legend(ui: &mut egui::Ui) {
             ui.add_space(10.0);
         }
     });
+}
+
+/// Action produced by one frame of the config-error banner.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigErrorAction {
+    None,
+    OpenFile,
+    Reload,
+}
+
+/// Opens `path` with the OS default application for it, mirroring how
+/// `stream::no_window_command` keeps ffmpeg from flashing a console window
+/// on Windows: the launcher itself must not pop one either.
+fn open_in_os_default_app(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
 }
 
 /// Inline error banner shared by Settings and Discover (dot + red mono text).
@@ -1075,10 +1106,27 @@ pub struct CamViewerApp {
     update_available: update::Shared,
     /// Cleared for the session once the user dismisses the notice.
     update_dismissed: bool,
+    /// Set when `cameras.toml` could not be read at startup or on RELOAD.
+    /// While this stands, `commit_cameras` refuses to overwrite the file
+    /// without first backing it up (see [`config::save_guarded`]).
+    config_error: Option<ConfigLoadError>,
+}
+
+/// Which view opens at launch. A pending load error keeps the user on
+/// Settings so the config-error banner (rendered independently of the
+/// active view, see [`CamViewerApp::show_config_error_banner`]) stays the
+/// visual focus instead of competing with the welcome screen. Otherwise Grid
+/// opens, which renders the T2 welcome screen itself when there are no
+/// cameras yet — there is no separate "welcome view" to route to.
+fn initial_view(has_load_error: bool, cameras_empty: bool) -> View {
+    match (has_load_error, cameras_empty) {
+        (true, _) => View::Settings,
+        (false, _) => View::Grid,
+    }
 }
 
 impl CamViewerApp {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, config_error: Option<ConfigLoadError>) -> Self {
         let cameras = config
             .cameras
             .iter()
@@ -1091,11 +1139,7 @@ impl CamViewerApp {
             .collect();
         Self {
             cameras,
-            view: if config.cameras.is_empty() {
-                View::Settings
-            } else {
-                View::Grid
-            },
+            view: initial_view(config_error.is_some(), config.cameras.is_empty()),
             settings: SettingsEditor::from_config(config),
             discover: None,
             badge_position: config.badge_position,
@@ -1106,6 +1150,7 @@ impl CamViewerApp {
                 update::Shared::default()
             },
             update_dismissed: false,
+            config_error,
         }
     }
 
@@ -1166,6 +1211,81 @@ impl CamViewerApp {
         self.update_dismissed = dismiss;
     }
 
+    /// Config-error banner, rendered independently of `self.view` (like
+    /// [`CamViewerApp::show_update_notice`]) so it stays visible no matter
+    /// which view is active while a load error is pending.
+    fn show_config_error_banner(&mut self, ctx: &egui::Context) {
+        let Some(err) = self.config_error.clone() else {
+            return;
+        };
+        let mut action = ConfigErrorAction::None;
+        egui::TopBottomPanel::top("config_error_banner")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PAPER)
+                    .inner_margin(egui::Margin::symmetric(16, 10)),
+            )
+            .show(ctx, |ui| {
+                paper_visuals(ui);
+                ui.label(
+                    egui::RichText::new("CAMERAS.TOML COULD NOT BE READ")
+                        .font(theme::display_font(15.0))
+                        .color(theme::STATUS_OFFLINE),
+                );
+                ui.add_space(2.0);
+                error_line(ui, &err.message);
+                ui.label(theme::micro_label(
+                    err.path.display().to_string(),
+                    theme::LABEL_ON_PAPER,
+                ));
+                ui.label(theme::micro_label(
+                    "Your file was not changed.",
+                    theme::LABEL_ON_PAPER,
+                ));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if theme::brutal_button(ui, "OPEN FILE", BtnVariant::Paper) {
+                        action = ConfigErrorAction::OpenFile;
+                    }
+                    if theme::brutal_button(ui, "RELOAD", BtnVariant::Confirm) {
+                        action = ConfigErrorAction::Reload;
+                    }
+                });
+            });
+        match action {
+            ConfigErrorAction::OpenFile => open_in_os_default_app(&err.path),
+            ConfigErrorAction::Reload => self.reload_config(),
+            ConfigErrorAction::None => {}
+        }
+    }
+
+    /// Re-runs `config::load` without restarting the app. On success this
+    /// rebuilds cameras/settings exactly like a normal save-apply and clears
+    /// the pending error; on failure the banner message is updated in place.
+    fn reload_config(&mut self) {
+        let path = self
+            .config_error
+            .as_ref()
+            .map(|err| err.path.clone())
+            .unwrap_or_else(config::config_path);
+        match config::load(&path) {
+            Ok(cfg) => {
+                self.badge_position = cfg.badge_position;
+                self.update_check = cfg.update_check;
+                self.settings = SettingsEditor::from_config(&cfg);
+                self.apply_cameras(cfg.cameras.clone());
+                self.config_error = None;
+                self.view = initial_view(false, self.cameras.is_empty());
+            }
+            Err(err) => {
+                self.config_error = Some(ConfigLoadError {
+                    path,
+                    message: format!("{err:#}"),
+                });
+            }
+        }
+    }
+
     fn camera_configs(&self) -> Vec<CameraConfig> {
         self.cameras
             .iter()
@@ -1194,18 +1314,23 @@ impl CamViewerApp {
         update_check: bool,
         cameras: Vec<CameraConfig>,
     ) -> Result<(), String> {
-        config::save(
+        config::save_guarded(
             &config::config_path(),
             &Config {
                 badge_position,
                 update_check,
                 cameras: cameras.clone(),
             },
+            self.config_error.is_some(),
         )
         .map_err(|err| format!("Failed to save config: {err:#}"))?;
         self.badge_position = badge_position;
         self.update_check = update_check;
         self.apply_cameras(cameras);
+        // A save only ever reaches here after config::save_guarded succeeded
+        // (backing up the original first if a load error was pending), so
+        // the file on disk now matches in-memory state again.
+        self.config_error = None;
         self.view = View::Grid;
         Ok(())
     }
@@ -1336,6 +1461,7 @@ impl eframe::App for CamViewerApp {
             self.view = View::Grid;
         }
 
+        self.show_config_error_banner(ctx);
         self.show_update_notice(ctx);
 
         let sidebar = show_sidebar(ctx, &self.view, &self.cameras);
@@ -1362,12 +1488,7 @@ impl eframe::App for CamViewerApp {
             },
             View::Solo(index) => {
                 if index >= self.cameras.len()
-                    || show_solo(
-                        ctx,
-                        &mut self.cameras[index],
-                        index,
-                        self.badge_position,
-                    )
+                    || show_solo(ctx, &mut self.cameras[index], index, self.badge_position)
                 {
                     self.view = View::Grid;
                 }
@@ -1731,12 +1852,20 @@ fn video_surface(
 
     let is_muted = cam.stream.muted();
     let mute_text = if is_muted { "MUTE" } else { "UNMUTE" };
-    let mute_rect = theme::chip_rect(&painter, egui::pos2(rect.left() + 8.0, rect.top() + 8.0), mute_text);
+    let mute_rect = theme::chip_rect(
+        &painter,
+        egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
+        mute_text,
+    );
     let mute_response = ui.interact(mute_rect, surface_id.with("mute"), egui::Sense::click());
     if mute_response.clicked() {
         cam.stream.set_muted(!is_muted);
     }
-    let mute_fg = if is_muted { theme::STATUS_OFFLINE } else { theme::STATUS_ONLINE };
+    let mute_fg = if is_muted {
+        theme::STATUS_OFFLINE
+    } else {
+        theme::STATUS_ONLINE
+    };
     theme::draw_chip(&painter, mute_rect, mute_text, mute_fg, theme::SOOT_2);
 
     match cam.stream.latest_frame() {
@@ -1973,7 +2102,11 @@ fn instrument_row(ui: &mut egui::Ui, cam: &CameraView, camera_index: usize) {
 
     let is_muted = cam.stream.muted();
     let mute_text = if is_muted { "MUTE" } else { "UNMUTE" };
-    let mute_rect = theme::chip_rect(&painter, egui::pos2(rect.left() + 8.0, rect.top() + 8.0), mute_text);
+    let mute_rect = theme::chip_rect(
+        &painter,
+        egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
+        mute_text,
+    );
     let mute_response = ui.interact(
         mute_rect,
         egui::Id::new(("solo_instrument_mute", camera_index)),
@@ -1982,7 +2115,11 @@ fn instrument_row(ui: &mut egui::Ui, cam: &CameraView, camera_index: usize) {
     if mute_response.clicked() {
         cam.stream.set_muted(!is_muted);
     }
-    let mute_fg = if is_muted { theme::STATUS_OFFLINE } else { theme::STATUS_ONLINE };
+    let mute_fg = if is_muted {
+        theme::STATUS_OFFLINE
+    } else {
+        theme::STATUS_ONLINE
+    };
     theme::draw_chip(&painter, mute_rect, mute_text, mute_fg, theme::SOOT_2);
 
     recording_control(
@@ -2515,7 +2652,10 @@ mod tests {
             "rtsp://192.168.100.11:554/live/ch0",
         ));
         row.exact_duplicate = true;
-        assert!(!row.addable(), "adding a configured address is still a no-op");
+        assert!(
+            !row.addable(),
+            "adding a configured address is still a no-op"
+        );
 
         row.relink_to = Some("Cochera".to_owned());
         assert!(row.addable(), "relinking it is a real action");
@@ -2587,7 +2727,10 @@ mod tests {
     #[test]
     fn one_unambiguous_candidate_is_preselected_but_two_are_not() {
         let one = vec![camera("Lateral", "rtsp://192.168.100.5:554/live/ch0")];
-        let results = vec![found([192, 168, 100, 22], "rtsp://192.168.100.22:554/live/ch0")];
+        let results = vec![found(
+            [192, 168, 100, 22],
+            "rtsp://192.168.100.22:554/live/ch0",
+        )];
         let mut rows = Vec::new();
         reconcile_rows(&mut rows, &results, &one);
         assert_eq!(rows[0].relink_to.as_deref(), Some("Lateral"));
@@ -2615,9 +2758,18 @@ mod tests {
 
     #[test]
     fn typed_path_is_normalised_to_one_leading_slash() {
-        assert_eq!(normalized_path("/media/video1").as_deref(), Some("/media/video1"));
-        assert_eq!(normalized_path("media/video1").as_deref(), Some("/media/video1"));
-        assert_eq!(normalized_path("  /live.sdp  ").as_deref(), Some("/live.sdp"));
+        assert_eq!(
+            normalized_path("/media/video1").as_deref(),
+            Some("/media/video1")
+        );
+        assert_eq!(
+            normalized_path("media/video1").as_deref(),
+            Some("/media/video1")
+        );
+        assert_eq!(
+            normalized_path("  /live.sdp  ").as_deref(),
+            Some("/live.sdp")
+        );
         assert_eq!(normalized_path("//live").as_deref(), Some("/live"));
     }
 
@@ -2659,7 +2811,8 @@ mod tests {
     fn credentials_row_stays_unaddable_even_with_a_typed_path() {
         // Only PathUnknown accepts a hand-typed path; a host that answered
         // BadCredentials still needs credentials and a rescan.
-        let mut row = DiscoverRow::new(result([192, 168, 1, 91], None, RowStatus::NeedsCredentials));
+        let mut row =
+            DiscoverRow::new(result([192, 168, 1, 91], None, RowStatus::NeedsCredentials));
         row.manual_path = "/live".to_owned();
         assert_eq!(row.effective_url(), None);
         assert!(!row.addable());
@@ -2754,8 +2907,27 @@ mod tests {
         // discovery always states it explicitly. A raw string comparison
         // missed this and re-added the same physical camera as a duplicate.
         let existing = vec![camera("Cochera", "rtsp://192.168.100.6/live/ch0")];
-        let extra = vec![camera("Generic 192.168.100.6", "rtsp://192.168.100.6:554/live/ch0")];
+        let extra = vec![camera(
+            "Generic 192.168.100.6",
+            "rtsp://192.168.100.6:554/live/ch0",
+        )];
         assert_eq!(merge_cameras(&existing, extra), existing);
+    }
+
+    #[test]
+    fn initial_view_prefers_the_config_error_banner_over_welcome() {
+        // A pending load error must stay the focus: welcome (which now backs
+        // the empty Grid too) never competes with it for attention.
+        assert!(matches!(initial_view(true, true), View::Settings));
+        assert!(matches!(initial_view(true, false), View::Settings));
+    }
+
+    #[test]
+    fn initial_view_without_an_error_always_opens_grid() {
+        // Grid renders the T2 welcome screen itself when there are no
+        // cameras yet, so there is no separate "welcome view" variant.
+        assert!(matches!(initial_view(false, true), View::Grid));
+        assert!(matches!(initial_view(false, false), View::Grid));
     }
 
     #[test]
@@ -2790,11 +2962,8 @@ mod tests {
         already.checked = true;
         already.duplicate = true;
         already.exact_duplicate = true;
-        let mut needs_creds = DiscoverRow::new(result(
-            [192, 168, 1, 67],
-            None,
-            RowStatus::NeedsCredentials,
-        ));
+        let mut needs_creds =
+            DiscoverRow::new(result([192, 168, 1, 67], None, RowStatus::NeedsCredentials));
         needs_creds.checked = true;
 
         let rows = vec![hit, unchecked, already, needs_creds];
@@ -2897,7 +3066,7 @@ mod tests {
     }
 
     fn headless_app() -> CamViewerApp {
-        CamViewerApp::new(&Config::default())
+        CamViewerApp::new(&Config::default(), None)
     }
 
     #[test]

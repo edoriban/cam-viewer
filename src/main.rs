@@ -9,17 +9,24 @@ fn main() -> eframe::Result<()> {
     // Answered before any window opens. Note that the Windows GUI subsystem
     // gives the process no console, so this print is only visible where one is
     // already attached; attaching one needs FFI, which this crate forbids.
-    if std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V") {
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
         println!("cam-viewer {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
     let path = config::config_path();
-    let cfg = match config::load(&path) {
-        Ok(cfg) => cfg,
+    let (cfg, load_error) = match config::load(&path) {
+        Ok(cfg) => (cfg, None),
         Err(err) => {
             eprintln!("failed to load cameras.toml: {err:#}");
-            config::Config::default()
+            let message = format!("{err:#}");
+            (
+                config::Config::default(),
+                Some(config::ConfigLoadError { path, message }),
+            )
         }
     };
 
@@ -35,7 +42,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             cam_viewer::theme::install(&cc.egui_ctx);
-            Ok(Box::new(CamViewerApp::new(&cfg)))
+            Ok(Box::new(CamViewerApp::new(&cfg, load_error)))
         }),
     )
 }
