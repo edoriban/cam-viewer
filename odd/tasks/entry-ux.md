@@ -66,6 +66,7 @@ UX pass published at https://claude.ai/artifact/4RHTdmE23w8tzbB9FyZ5GS; user ask
 - T3 fix: regression test calls a no-op helper, so it would not catch an Online assignment re-added inside `run_loop` (stream.rs:972-986).
 - T3: `retry_wake` is only cleared at the end of `sleep_interruptible`; a RETRY NOW click after the sleep returns zeroes the next backoff (stream.rs:315).
 - T1: dead `initial_view` param (app.rs:1115-1124), duplicated CREATE_NO_WINDOW const, a successful backup isn't reported to the user.
+- T4 `b9850dd` — assessed medium, `under_budget` (344 lines since boundary `ca21665`); pending in the slice, no review run yet. Review it when the T3/T4 PR slice is prepared or when a later commit reaches the budget.
 
 ## Environment notes
 - `.codegraph/` added to `.git/info/exclude` (local only) so review inventory has no untracked files.
