@@ -1576,10 +1576,20 @@ fn show_sidebar(ctx: &egui::Context, view: &View, cameras: &[CameraView]) -> Sid
             ui.add_space(10.0);
             hairline(ui, theme::SOOT_2, 2.0);
             ui.add_space(8.0);
-            ui.label(theme::micro_label(
-                format!("{} SIGNALS \u{b7} LOCAL ONLY", cameras.len()),
-                theme::ASH,
-            ));
+            let counts = StatusCounts::tally(cameras.iter().map(|c| c.stream.status()));
+            let (main, suffix) = sidebar_summary(counts);
+            let main_color = if counts.total == 0 {
+                theme::ASH
+            } else {
+                theme::STATUS_ONLINE
+            };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.label(theme::micro_label(main, main_color));
+                if !suffix.is_empty() {
+                    ui.label(theme::micro_label(suffix, theme::ASH));
+                }
+            });
             ui.add_space(14.0);
 
             let grid_active = matches!(view, View::Grid | View::Solo(_));
@@ -1967,13 +1977,29 @@ fn video_surface(
             );
         }
         None => {
-            let msg = match cam.stream.status() {
-                Status::Online => format!("{}: waiting for frames...", cam.name),
-                Status::Connecting => format!("{}: connecting...", cam.name),
-                Status::Offline => format!("{}: offline", cam.name),
-                Status::Paused => format!("{}: paused", cam.name),
-            };
-            center_message(&painter, rect, msg);
+            let status = cam.stream.status();
+            let has_frame = cam.stream.has_frame();
+            match status {
+                Status::Paused => {
+                    center_message(&painter, rect, format!("{}: paused", cam.name));
+                }
+                Status::Offline => {
+                    offline_tile(ui, rect, cam, surface_id);
+                }
+                _ => {
+                    if let Some(band) = tile_band(status, has_frame) {
+                        painter.text(
+                            rect.center() + egui::vec2(0.0, -18.0),
+                            egui::Align2::CENTER_CENTER,
+                            &cam.name,
+                            theme::mono_font(12.5),
+                            theme::ghost_text(),
+                        );
+                        let elapsed = cam.stream.phase_started_at().elapsed();
+                        phase_band(&painter, rect, band, elapsed);
+                    }
+                }
+            }
         }
     }
 
@@ -2014,10 +2040,108 @@ fn video_surface(
 
         // Name stays pinned top-left; the badge renders at the configured
         // corner so it can never collide with the name overlay.
-        theme::status_badge(&painter, rect, cam.stream.status(), badge_position);
+        let (badge_status, badge_label) =
+            badge_display(cam.stream.status(), cam.stream.has_frame());
+        theme::status_badge(&painter, rect, badge_status, badge_position, badge_label);
     }
 
     response.clicked()
+}
+
+/// Bottom-of-tile phase band drawn while a stream is Connecting or Online
+/// without a frame yet (T3): "reach · stream · live" segments (only two are
+/// ever drawn as distinct here, since "live" is implied by the band no
+/// longer showing at all once a frame arrives), current segment
+/// STATUS_CONNECTING, done segments STATUS_ONLINE, pending BORDER_DIM.
+fn phase_band(painter: &egui::Painter, rect: egui::Rect, band: TileBand, elapsed: Duration) {
+    let height = 22.0;
+    let band_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.bottom() - height),
+        rect.right_bottom(),
+    );
+    painter.rect_filled(band_rect, 0.0, theme::SOOT_2);
+
+    let current = band.current_segment();
+    let segment_w = band_rect.width() / 3.0;
+    for (i, _phase_name) in ["reach", "stream", "live"].iter().enumerate() {
+        let color = match i.cmp(&current) {
+            std::cmp::Ordering::Less => theme::STATUS_ONLINE,
+            std::cmp::Ordering::Equal => theme::STATUS_CONNECTING,
+            std::cmp::Ordering::Greater => theme::BORDER_DIM,
+        };
+        let seg_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                band_rect.left() + segment_w * i as f32 + 1.0,
+                band_rect.top(),
+            ),
+            egui::vec2(segment_w - 2.0, 3.0),
+        );
+        painter.rect_filled(seg_rect, 0.0, color);
+    }
+
+    painter.text(
+        egui::pos2(band_rect.left() + 8.0, band_rect.center().y + 4.0),
+        egui::Align2::LEFT_CENTER,
+        band.label(),
+        theme::mono_font(9.5),
+        theme::PAPER,
+    );
+    painter.text(
+        egui::pos2(band_rect.right() - 8.0, band_rect.center().y + 4.0),
+        egui::Align2::RIGHT_CENTER,
+        format!("{}S", elapsed.as_secs()),
+        theme::mono_font(9.5),
+        theme::ghost_text(),
+    );
+}
+
+/// Full-tile Offline message (T3): attempt count, countdown to the next
+/// retry, and a RETRY NOW control that calls `StreamHandle::retry_now`.
+fn offline_tile(ui: &mut egui::Ui, rect: egui::Rect, cam: &CameraView, surface_id: egui::Id) {
+    let painter = ui.painter_at(rect);
+    let attempts = cam.stream.attempts();
+    painter.text(
+        rect.center() + egui::vec2(0.0, -18.0),
+        egui::Align2::CENTER_CENTER,
+        format!("{}: NO RESPONSE \u{b7} ATTEMPT {attempts}", cam.name),
+        theme::mono_font(12.0),
+        theme::ghost_text(),
+    );
+    let remaining = cam
+        .stream
+        .next_retry_at()
+        .map(|at| {
+            at.saturating_duration_since(std::time::Instant::now())
+                .as_secs()
+        })
+        .unwrap_or(0);
+    painter.text(
+        rect.center() + egui::vec2(0.0, 2.0),
+        egui::Align2::CENTER_CENTER,
+        format!("next try in {remaining}s"),
+        theme::mono_font(10.0),
+        theme::ghost_text(),
+    );
+
+    let label = "RETRY NOW";
+    let measured = theme::chip_rect(&painter, egui::pos2(0.0, 0.0), label);
+    let retry_rect =
+        egui::Rect::from_center_size(rect.center() + egui::vec2(0.0, 26.0), measured.size());
+    let response = ui.interact(
+        retry_rect,
+        surface_id.with("retry_now"),
+        egui::Sense::click(),
+    );
+    if response.clicked() {
+        cam.stream.retry_now();
+    }
+    let hovered = response.hovered();
+    let (fg, bg) = if hovered {
+        (theme::SOOT, theme::PAPER)
+    } else {
+        (theme::PAPER, theme::SOOT_2)
+    };
+    theme::draw_chip(&painter, retry_rect, label, fg, bg);
 }
 
 fn recording_control(ui: &mut egui::Ui, cam: &CameraView, rect: egui::Rect, surface_id: egui::Id) {
@@ -2076,6 +2200,97 @@ fn recording_control(ui: &mut egui::Ui, cam: &CameraView, rect: egui::Rect, surf
     if let crate::stream::RecordingState::Failed(error) = &state {
         response.on_hover_text(error);
     }
+}
+
+/// Which phase band (if any) a tile shows for `status` given whether a frame
+/// has ever arrived (T3). `None` for Offline (its own "NO RESPONSE" message)
+/// and Paused (unchanged), which never draw the band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TileBand {
+    /// Attempting to reach the camera (`Status::Connecting`); segment 1.
+    Reaching,
+    /// Stream process open, decoding, no frame published yet; segment 2.
+    StreamOpen,
+}
+
+impl TileBand {
+    fn label(self) -> &'static str {
+        match self {
+            TileBand::Reaching => "CONNECTING",
+            TileBand::StreamOpen => "STREAM OPEN \u{b7} NO FRAMES YET",
+        }
+    }
+
+    /// 0-based index of the currently active segment; earlier ones are done.
+    fn current_segment(self) -> usize {
+        match self {
+            TileBand::Reaching => 0,
+            TileBand::StreamOpen => 1,
+        }
+    }
+}
+
+fn tile_band(status: Status, has_frame: bool) -> Option<TileBand> {
+    match status {
+        Status::Connecting => Some(TileBand::Reaching),
+        Status::Online if !has_frame => Some(TileBand::StreamOpen),
+        _ => None,
+    }
+}
+
+/// (status, label override) for the tile's corner badge (T3): Online without
+/// a frame yet reads as "STARTING"/STATUS_CONNECTING rather than a premature
+/// ONLINE claim before any picture has arrived.
+fn badge_display(status: Status, has_frame: bool) -> (Status, Option<&'static str>) {
+    if status == Status::Online && !has_frame {
+        (Status::Connecting, Some("STARTING"))
+    } else {
+        (status, None)
+    }
+}
+
+/// Camera health counts backing the sidebar header (T3), kept as its own
+/// struct so the counting logic is unit-testable without an `egui::Ui`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct StatusCounts {
+    online: usize,
+    connecting: usize,
+    offline: usize,
+    total: usize,
+}
+
+impl StatusCounts {
+    fn tally(statuses: impl IntoIterator<Item = Status>) -> Self {
+        let mut counts = Self::default();
+        for status in statuses {
+            counts.total += 1;
+            match status {
+                Status::Online => counts.online += 1,
+                Status::Connecting => counts.connecting += 1,
+                Status::Offline => counts.offline += 1,
+                Status::Paused => {}
+            }
+        }
+        counts
+    }
+}
+
+/// Sidebar header text, split so the "N/M ONLINE" part can be drawn in
+/// STATUS_ONLINE while the rest stays ASH. `total == 0` keeps the original
+/// "0 SIGNALS · LOCAL ONLY" copy instead of a nonsensical "0/0 ONLINE".
+fn sidebar_summary(counts: StatusCounts) -> (String, String) {
+    if counts.total == 0 {
+        return ("0 SIGNALS \u{b7} LOCAL ONLY".to_owned(), String::new());
+    }
+    let main = format!("{}/{} ONLINE", counts.online, counts.total);
+    let mut suffix = String::new();
+    if counts.connecting > 0 {
+        suffix.push_str(&format!(" \u{b7} {} CONNECTING", counts.connecting));
+    }
+    if counts.offline > 0 {
+        suffix.push_str(&format!(" \u{b7} {} OFFLINE", counts.offline));
+    }
+    (main, suffix)
 }
 
 fn center_message(painter: &egui::Painter, rect: egui::Rect, text: impl Into<String>) {
@@ -3025,6 +3240,92 @@ mod tests {
             "Hikvision 192.168.1.64"
         );
         assert_eq!(discovered_name(None, ip, 3), "Cam 3");
+    }
+
+    #[test]
+    fn tile_band_is_reaching_while_connecting_and_stream_open_while_online_without_a_frame() {
+        assert_eq!(
+            tile_band(Status::Connecting, false),
+            Some(TileBand::Reaching)
+        );
+        assert_eq!(
+            tile_band(Status::Connecting, true),
+            Some(TileBand::Reaching)
+        );
+        assert_eq!(tile_band(Status::Online, false), Some(TileBand::StreamOpen));
+    }
+
+    #[test]
+    fn tile_band_is_none_once_a_frame_has_arrived_or_while_offline_or_paused() {
+        assert_eq!(tile_band(Status::Online, true), None);
+        assert_eq!(tile_band(Status::Offline, false), None);
+        assert_eq!(tile_band(Status::Paused, false), None);
+    }
+
+    #[test]
+    fn badge_display_overrides_online_without_a_frame_to_starting() {
+        assert_eq!(
+            badge_display(Status::Online, false),
+            (Status::Connecting, Some("STARTING"))
+        );
+    }
+
+    #[test]
+    fn badge_display_is_unchanged_once_a_frame_has_arrived_or_for_other_statuses() {
+        assert_eq!(badge_display(Status::Online, true), (Status::Online, None));
+        assert_eq!(
+            badge_display(Status::Connecting, false),
+            (Status::Connecting, None)
+        );
+        assert_eq!(
+            badge_display(Status::Offline, false),
+            (Status::Offline, None)
+        );
+        assert_eq!(badge_display(Status::Paused, false), (Status::Paused, None));
+    }
+
+    fn counts(online: usize, connecting: usize, offline: usize, paused: usize) -> StatusCounts {
+        let mut statuses = Vec::new();
+        statuses.extend(std::iter::repeat_n(Status::Online, online));
+        statuses.extend(std::iter::repeat_n(Status::Connecting, connecting));
+        statuses.extend(std::iter::repeat_n(Status::Offline, offline));
+        statuses.extend(std::iter::repeat_n(Status::Paused, paused));
+        StatusCounts::tally(statuses)
+    }
+
+    #[test]
+    fn status_counts_tally_by_bucket_and_total() {
+        let c = counts(2, 1, 1, 1);
+        assert_eq!(c.total, 5);
+        assert_eq!(c.online, 2);
+        assert_eq!(c.connecting, 1);
+        assert_eq!(c.offline, 1);
+    }
+
+    #[test]
+    fn sidebar_summary_keeps_the_zero_camera_copy() {
+        let (main, suffix) = sidebar_summary(counts(0, 0, 0, 0));
+        assert_eq!(main, "0 SIGNALS \u{b7} LOCAL ONLY");
+        assert_eq!(suffix, "");
+    }
+
+    #[test]
+    fn sidebar_summary_reports_online_over_total_and_only_non_zero_buckets() {
+        let (main, suffix) = sidebar_summary(counts(2, 1, 0, 0));
+        assert_eq!(main, "2/3 ONLINE");
+        assert_eq!(suffix, " \u{b7} 1 CONNECTING");
+
+        let (main, suffix) = sidebar_summary(counts(1, 0, 2, 0));
+        assert_eq!(main, "1/3 ONLINE");
+        assert_eq!(suffix, " \u{b7} 2 OFFLINE");
+
+        let (main, suffix) = sidebar_summary(counts(1, 1, 1, 0));
+        assert_eq!(main, "1/3 ONLINE");
+        assert_eq!(suffix, " \u{b7} 1 CONNECTING \u{b7} 1 OFFLINE");
+
+        let (main, suffix) = sidebar_summary(counts(3, 0, 0, 0));
+        assert_eq!(main, "3/3 ONLINE");
+        assert_eq!(suffix, "");
     }
 
     #[test]

@@ -320,14 +320,20 @@ pub fn nav_item(ui: &mut egui::Ui, label: &str, count: Option<String>, active: b
     response.clicked()
 }
 
-/// Status chip mounted on a video tile's configured corner.
+/// Status chip mounted on a video tile's configured corner. `label_override`
+/// lets a caller show different text than `status.label()` while keeping the
+/// color that `status` implies (used by T3 to show "STARTING" in the
+/// STATUS_CONNECTING color for a stream that is Online but has no frame yet).
 pub fn status_badge(
     painter: &egui::Painter,
     tile: egui::Rect,
     status: Status,
     position: BadgePosition,
+    label_override: Option<&str>,
 ) {
-    let text = status.label().to_uppercase();
+    let text = label_override
+        .unwrap_or_else(|| status.label())
+        .to_uppercase();
     let text_color = match status {
         Status::Online | Status::Connecting => SOOT,
         Status::Offline | Status::Paused => PAPER,
@@ -371,7 +377,12 @@ pub fn draw_chip(
 ) {
     let galley = painter.layout_no_wrap(text.to_owned(), mono_font(10.0), fg);
     painter.rect_filled(rect, 0.0, bg);
-    painter.rect_stroke(rect, 0.0, egui::Stroke::new(2.0_f32, fg), egui::StrokeKind::Inside);
+    painter.rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(2.0_f32, fg),
+        egui::StrokeKind::Inside,
+    );
     painter.galley(rect.center() - galley.size() / 2.0, galley, fg);
 }
 

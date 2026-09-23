@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -60,6 +60,21 @@ struct Shared {
     recording: Arc<Mutex<Option<Child>>>,
     recording_state: Arc<Mutex<RecordingState>>,
     audio_child: Arc<Mutex<Option<Child>>>,
+    /// Reconnect attempts since the last successfully published frame; reset
+    /// to 0 by every frame `read_frames` publishes, not just the first ever.
+    attempts: Arc<AtomicU32>,
+    /// Deadline of the current reconnect backoff sleep, `Some` only while
+    /// actually waiting in it.
+    next_retry: Arc<Mutex<Option<Instant>>>,
+    /// Start time of the current phase (a reconnect attempt, or the stream
+    /// being open with no frame yet), used to render elapsed time in tiles.
+    phase_started: Arc<Mutex<Instant>>,
+    /// Set once this stream has ever published a frame; never cleared, since
+    /// the last frame is kept forever once published (see `read_frames`).
+    has_frame: Arc<AtomicBool>,
+    /// Set by `StreamHandle::retry_now` to wake an in-progress backoff sleep
+    /// immediately; consumed (cleared) by `sleep_interruptible` itself.
+    retry_wake: Arc<AtomicBool>,
 }
 
 pub struct StreamHandle {
@@ -80,6 +95,11 @@ impl StreamHandle {
             recording: Arc::new(Mutex::new(None)),
             recording_state: Arc::new(Mutex::new(RecordingState::Idle)),
             audio_child: Arc::new(Mutex::new(None)),
+            attempts: Arc::new(AtomicU32::new(0)),
+            next_retry: Arc::new(Mutex::new(None)),
+            phase_started: Arc::new(Mutex::new(Instant::now())),
+            has_frame: Arc::new(AtomicBool::new(false)),
+            retry_wake: Arc::new(AtomicBool::new(false)),
         };
         let thread_shared = shared.clone();
         thread::Builder::new()
@@ -101,6 +121,32 @@ impl StreamHandle {
 
     pub fn status(&self) -> Status {
         *lock(&self.shared.status)
+    }
+
+    /// Reconnect attempts since the last frame this stream published.
+    pub fn attempts(&self) -> u32 {
+        self.shared.attempts.load(Ordering::Relaxed)
+    }
+
+    /// Deadline of the current reconnect backoff, if one is in progress.
+    pub fn next_retry_at(&self) -> Option<Instant> {
+        *lock(&self.shared.next_retry)
+    }
+
+    /// Start time of the current phase (see [`Shared::phase_started`]).
+    pub fn phase_started_at(&self) -> Instant {
+        *lock(&self.shared.phase_started)
+    }
+
+    /// Whether this stream has ever published a frame.
+    pub fn has_frame(&self) -> bool {
+        self.shared.has_frame.load(Ordering::Relaxed)
+    }
+
+    /// Wakes an in-progress reconnect backoff immediately instead of waiting
+    /// out the rest of `RECONNECT_DELAY`.
+    pub fn retry_now(&self) {
+        self.shared.retry_wake.store(true, Ordering::Relaxed);
     }
 
     pub fn stop(&self) {
@@ -207,7 +253,6 @@ impl StreamHandle {
     pub fn grab_stop(&self) {
         self.stop_recording();
     }
-
 }
 
 impl Drop for StreamHandle {
@@ -248,15 +293,47 @@ fn stop_child(child_slot: &Mutex<Option<Child>>) {
     }
 }
 
-fn sleep_interruptible(shutdown: &AtomicBool, paused: &AtomicBool, total: Duration) {
+/// Sleeps up to `total`, waking early on shutdown, pause, or `retry_wake`
+/// (consumed here so it never cancels a later, unrelated sleep).
+fn sleep_interruptible(
+    shutdown: &AtomicBool,
+    paused: &AtomicBool,
+    retry_wake: &AtomicBool,
+    total: Duration,
+) {
     let step = Duration::from_millis(250);
     let deadline = Instant::now() + total;
     while !shutdown.load(Ordering::Relaxed)
         && !paused.load(Ordering::Relaxed)
+        && !retry_wake.load(Ordering::Relaxed)
         && Instant::now() < deadline
     {
         thread::sleep(step.min(deadline.saturating_duration_since(Instant::now())));
     }
+    retry_wake.store(false, Ordering::Relaxed);
+}
+
+/// Runs immediately before each reconnect attempt (T3): bumps the attempt
+/// count, clears any stale retry deadline, and resets the phase clock so
+/// tiles can render "elapsed since this attempt began". Kept as its own
+/// function so the accounting is unit-testable without spawning ffmpeg.
+fn begin_attempt(shared: &Shared) {
+    shared.attempts.fetch_add(1, Ordering::Relaxed);
+    *lock(&shared.next_retry) = None;
+    *lock(&shared.phase_started) = Instant::now();
+    *lock(&shared.status) = Status::Connecting;
+}
+
+/// Runs after a failed attempt (spawn failure or the stream ending): moves
+/// to Offline, schedules `next_retry_at`, and sleeps the backoff —
+/// interruptibly by shutdown, pause, or `StreamHandle::retry_now`. `delay`
+/// is a parameter (rather than reading `RECONNECT_DELAY` directly) so tests
+/// can exercise this with a short, deterministic duration.
+fn enter_backoff(shared: &Shared, delay: Duration) {
+    *lock(&shared.status) = Status::Offline;
+    *lock(&shared.next_retry) = Some(Instant::now() + delay);
+    sleep_interruptible(&shared.shutdown, &shared.paused, &shared.retry_wake, delay);
+    *lock(&shared.next_retry) = None;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,11 +468,16 @@ fn run_loop(shared: Shared, url: &str) {
                 *lock(&shared.status) = Status::Paused;
             }
             let _ = probe_rtsp(url, PAUSED_PROBE_TIMEOUT);
-            sleep_interruptible(&shared.shutdown, &shared.paused, PAUSED_PROBE_INTERVAL);
+            sleep_interruptible(
+                &shared.shutdown,
+                &shared.paused,
+                &shared.retry_wake,
+                PAUSED_PROBE_INTERVAL,
+            );
             continue;
         }
         paused_seen = false;
-        *lock(&shared.status) = Status::Connecting;
+        begin_attempt(&shared);
 
         let io_timeout = STREAM_IO_TIMEOUT.as_micros().to_string();
         let child = no_window_command("ffmpeg")
@@ -424,11 +506,17 @@ fn run_loop(shared: Shared, url: &str) {
         let mut child = match child {
             Ok(child) => child,
             Err(_) => {
-                *lock(&shared.status) = Status::Offline;
-                sleep_interruptible(&shared.shutdown, &shared.paused, RECONNECT_DELAY);
+                enter_backoff(&shared, RECONNECT_DELAY);
                 continue;
             }
         };
+
+        // Process spawned: the "reach" phase is done, so the "stream open,
+        // no frame yet" phase (T3) starts now. Externally this is still
+        // Status::Online (app.rs distinguishes "no frame yet" via
+        // `has_frame`), so nothing downstream of `status()` needs to change.
+        *lock(&shared.phase_started) = Instant::now();
+        *lock(&shared.status) = Status::Online;
 
         let mut stdout = child.stdout.take();
         *lock(&shared.child) = Some(child);
@@ -445,8 +533,7 @@ fn run_loop(shared: Shared, url: &str) {
         if shared.paused.load(Ordering::Relaxed) {
             continue;
         }
-        *lock(&shared.status) = Status::Offline;
-        sleep_interruptible(&shared.shutdown, &shared.paused, RECONNECT_DELAY);
+        enter_backoff(&shared, RECONNECT_DELAY);
     }
     stop_child(&shared.child);
 }
@@ -478,7 +565,9 @@ fn audio_loop(shared: Shared, url: &str) {
             .args(["-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp"])
             .args(["-timeout", &io_timeout])
             .args(["-i", url])
-            .args(["-map", "0:a?", "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"])
+            .args([
+                "-map", "0:a?", "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-",
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn();
@@ -645,17 +734,23 @@ fn read_frames<R: Read>(shared: &Shared, reader: R) {
         };
         *lock(&shared.frame) = Some(Arc::new(frame));
         *lock(&shared.status) = Status::Online;
+        shared.has_frame.store(true, Ordering::Relaxed);
+        // Every frame resets the failure streak, not just the first one
+        // ever: this is "attempts since the last successful frame".
+        shared.attempts.store(0, Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod ppm_tests {
     use super::{
-        MAX_FRAME_BYTES, Shared, Status, StreamHandle, read_frames, read_ppm_header,
+        MAX_FRAME_BYTES, Shared, Status, StreamHandle, begin_attempt, enter_backoff, read_frames,
+        read_ppm_header, sleep_interruptible,
     };
     use std::io::Cursor;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     fn header(bytes: &[u8]) -> Option<(usize, usize)> {
         read_ppm_header(&mut Cursor::new(bytes.to_vec()))
@@ -673,6 +768,11 @@ mod ppm_tests {
             recording: Arc::new(Mutex::new(None)),
             recording_state: Arc::new(Mutex::new(super::RecordingState::Idle)),
             audio_child: Arc::new(Mutex::new(None)),
+            attempts: Arc::new(AtomicU32::new(0)),
+            next_retry: Arc::new(Mutex::new(None)),
+            phase_started: Arc::new(Mutex::new(Instant::now())),
+            has_frame: Arc::new(AtomicBool::new(false)),
+            retry_wake: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -731,7 +831,12 @@ mod ppm_tests {
         stream.extend(ppm_frame(2, 2, 0x22));
         read_frames(&shared, Cursor::new(stream));
 
-        let frame = shared.frame.lock().expect("frame lock").clone().expect("a frame");
+        let frame = shared
+            .frame
+            .lock()
+            .expect("frame lock")
+            .clone()
+            .expect("a frame");
         assert_eq!(frame.generation, 2, "both frames must be consumed");
         assert_eq!(frame.rgb, vec![0x22; 12], "latest frame wins");
         assert_eq!(*shared.status.lock().expect("status lock"), Status::Online);
@@ -746,7 +851,12 @@ mod ppm_tests {
         stream.extend(ppm_frame(4, 1, 0x33));
         read_frames(&shared, Cursor::new(stream));
 
-        let frame = shared.frame.lock().expect("frame lock").clone().expect("a frame");
+        let frame = shared
+            .frame
+            .lock()
+            .expect("frame lock")
+            .clone()
+            .expect("a frame");
         assert_eq!((frame.width, frame.height), (4, 1));
         assert_eq!(frame.rgb.len(), 12);
     }
@@ -790,10 +900,7 @@ mod ppm_tests {
             return;
         }
 
-        let handle = std::sync::Arc::new(StreamHandle::spawn(
-            "rtsp://127.0.0.1:1/none",
-            true,
-        ));
+        let handle = std::sync::Arc::new(StreamHandle::spawn("rtsp://127.0.0.1:1/none", true));
         let callers = (0..8)
             .map(|_| {
                 let handle = std::sync::Arc::clone(&handle);
@@ -801,15 +908,123 @@ mod ppm_tests {
             })
             .collect::<Vec<_>>();
         for caller in callers {
-            caller.join().expect("recording caller finishes").expect("start is idempotent");
+            caller
+                .join()
+                .expect("recording caller finishes")
+                .expect("start is idempotent");
         }
-        assert!(handle
-            .shared
-            .recording
-            .lock()
-            .expect("recording lock")
-            .is_some());
+        assert!(
+            handle
+                .shared
+                .recording
+                .lock()
+                .expect("recording lock")
+                .is_some()
+        );
         handle.stop_recording();
+        handle.stop();
+    }
+
+    #[test]
+    fn a_frame_resets_the_attempt_count_and_marks_has_frame() {
+        let shared = test_shared();
+        shared.attempts.store(3, Ordering::Relaxed);
+        assert!(!shared.has_frame.load(Ordering::Relaxed));
+
+        read_frames(&shared, Cursor::new(ppm_frame(2, 2, 0x11)));
+
+        assert_eq!(shared.attempts.load(Ordering::Relaxed), 0);
+        assert!(shared.has_frame.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn begin_attempt_increments_attempts_and_clears_the_retry_deadline() {
+        let shared = test_shared();
+        *shared.next_retry.lock().expect("lock") = Some(Instant::now());
+
+        begin_attempt(&shared);
+        assert_eq!(shared.attempts.load(Ordering::Relaxed), 1);
+        assert!(shared.next_retry.lock().expect("lock").is_none());
+        assert_eq!(*shared.status.lock().expect("lock"), Status::Connecting);
+
+        begin_attempt(&shared);
+        assert_eq!(
+            shared.attempts.load(Ordering::Relaxed),
+            2,
+            "each failed attempt keeps counting up"
+        );
+    }
+
+    #[test]
+    fn enter_backoff_schedules_a_retry_deadline_and_waits_it_out() {
+        let shared = test_shared();
+        let delay = Duration::from_millis(150);
+        let started = Instant::now();
+        enter_backoff(&shared, delay);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= delay,
+            "must wait out the full delay absent a wake: {elapsed:?}"
+        );
+        assert_eq!(*shared.status.lock().expect("lock"), Status::Offline);
+        assert!(
+            shared.next_retry.lock().expect("lock").is_none(),
+            "deadline is cleared once the backoff ends"
+        );
+    }
+
+    #[test]
+    fn retry_wake_shortens_an_in_progress_backoff() {
+        let shared = test_shared();
+        let long_delay = Duration::from_secs(5);
+        let retry_wake = Arc::clone(&shared.retry_wake);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            retry_wake.store(true, Ordering::Relaxed);
+        });
+
+        let started = Instant::now();
+        enter_backoff(&shared, long_delay);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "retry_wake must cut the 5s backoff short, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn sleep_interruptible_consumes_the_wake_flag_so_it_never_leaks_into_a_later_sleep() {
+        let shutdown = AtomicBool::new(false);
+        let paused = AtomicBool::new(false);
+        let retry_wake = AtomicBool::new(true);
+
+        // First call must return almost immediately because the flag is
+        // already set...
+        let started = Instant::now();
+        sleep_interruptible(&shutdown, &paused, &retry_wake, Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // ...and the flag must be cleared afterward, or a completely
+        // unrelated later sleep (e.g. the next reconnect delay) would also
+        // be cut short by a stale wake nobody asked for.
+        assert!(!retry_wake.load(Ordering::Relaxed));
+        let started = Instant::now();
+        sleep_interruptible(&shutdown, &paused, &retry_wake, Duration::from_millis(100));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn stream_handle_exposes_attempts_retry_deadline_and_has_frame() {
+        // Guards the public surface app.rs reads for tiles: constructible
+        // and readable without ffmpeg being present.
+        let handle = StreamHandle::spawn("rtsp://127.0.0.1:1/none", true);
+        let _ = handle.attempts();
+        let _ = handle.next_retry_at();
+        let _ = handle.phase_started_at();
+        assert!(!handle.has_frame());
+        handle.retry_now();
         handle.stop();
     }
 
@@ -818,7 +1033,9 @@ mod ppm_tests {
         let handle = StreamHandle::spawn("rtsp://127.0.0.1:1/none", true);
         assert_eq!(handle.recording_state(), super::RecordingState::Idle);
         let result = handle.start_recording("/dev/full");
-        assert!(result.is_ok() || matches!(handle.recording_state(), super::RecordingState::Failed(_)));
+        assert!(
+            result.is_ok() || matches!(handle.recording_state(), super::RecordingState::Failed(_))
+        );
         assert!(matches!(
             handle.recording_state(),
             super::RecordingState::Recording | super::RecordingState::Failed(_)
