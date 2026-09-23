@@ -23,9 +23,13 @@ UX pass published at https://claude.ai/artifact/4RHTdmE23w8tzbB9FyZ5GS; user ask
 - Work-unit commits on `feat/entry-ux`; push/PR/merge remain the user's decision.
 
 ## Tasks
-- [ ] T1 — Config load error is surfaced in-app (banner: path, message, OPEN FILE, RELOAD) and SAVE cannot overwrite an unreadable file (backup to `cameras.toml.bak` before writing). Route: delegated direct (writer trigger: main.rs, app.rs, config.rs).
-- [ ] T2 — First-run welcome view: primary DISCOVER, secondary ADD CAMERA; reused as Grid empty state. Route: delegated direct (app.rs + tests).
-- [ ] T3 — Stream exposes attempt count, next-retry instant and a retry-now wake; tiles show phase band (reach · stream · live) with elapsed time, offline attempt/countdown and RETRY NOW; sidebar summary `N/M ONLINE · x UP · y OFF`. Route: delegated direct (stream.rs, app.rs, theme.rs).
+- [x] T1 — Config load error is surfaced in-app (banner: path, message, OPEN FILE, RELOAD) and SAVE cannot overwrite an unreadable file (backup to `cameras.toml.bak` before writing). Route: delegated direct (writer trigger: main.rs, app.rs, config.rs).
+  - Commit `c7bfb27`. `cargo test` 119 lib + 6 discovery_scan + 1 ffmpeg_pipe passed, 1 live_probe ignored (baseline: 120 passed/1 ignored). `cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean on touched files (app.rs, config.rs, main.rs); repo-wide fmt has pre-existing diffs in untouched files (stream.rs, theme.rs, update.rs, discover/probe.rs), left alone.
+- [x] T2 — First-run welcome view: primary DISCOVER, secondary ADD CAMERA; reused as Grid empty state. Route: delegated direct (app.rs + tests).
+  - Commit `a1858c0`. `cargo test` 119 lib passed (same as T1 baseline; no new testable branches beyond T1's `initial_view`). `cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean for app.rs.
+- [x] T3 — Stream exposes attempt count, next-retry instant and a retry-now wake; tiles show phase band (reach · stream · live) with elapsed time, offline attempt/countdown and RETRY NOW; sidebar summary `N/M ONLINE · x UP · y OFF`. Route: delegated direct (stream.rs, app.rs, theme.rs).
+  - Commit `7d2b6ea`. `cargo test` 132 lib passed (119 + 13 new: 7 in stream.rs, 6 in app.rs), 6 discovery_scan + 1 ffmpeg_pipe passed, 1 live_probe ignored. `cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean on touched files (app.rs, stream.rs, theme.rs).
+  - Deviation: the "reach" phase ends as soon as the ffmpeg child process spawns (not once RTSP negotiation succeeds) since ffmpeg's stderr is discarded and not parsed for progress; the "reach" segment is near-instant and "stream" covers most of the real wait. Documented in the commit body.
 
 ## Acceptance criteria
 - [ ] Parse error → banner visible; file bytes unchanged until user saves; saving keeps the original as `.bak`.
@@ -42,6 +46,10 @@ UX pass published at https://claude.ai/artifact/4RHTdmE23w8tzbB9FyZ5GS; user ask
 
 ## Progress
 - Branch `feat/entry-ux` created from `main` @ 8c9cb8b.
+- T1, T2, T3 all implemented, tested, and committed (`c7bfb27`, `a1858c0`, `7d2b6ea`).
+- `cargo test` final: 132 lib + 6 discovery_scan + 1 ffmpeg_pipe passed, 1 live_probe ignored (baseline was 120 passed/1 ignored; +13 new unit tests, 0 regressions, 0 weakened tests).
+- `cargo clippy --all-targets -- -D warnings` clean after every commit.
+- `cargo fmt --check` clean on every file touched by this feature (app.rs, config.rs, main.rs, stream.rs, theme.rs). Pre-existing fmt drift in untouched files (src/stream.rs's audio_loop args formatting before T3 touched it, src/discover/probe.rs, src/update.rs) was deliberately left alone rather than reformatted as a side effect of running `cargo fmt` repo-wide.
 
 ## Next step
-Resolve delivery chain strategy, then T1.
+All three tasks are done. Remaining: push the branch / open PR(s) is the user's decision (not run automatically). The chain-strategy question in Delivery above was never explicitly answered by the user; work proceeded as three sequential commits on one branch per the task brief's instruction ("one commit per task, in order"), leaving PR slicing to the user.
