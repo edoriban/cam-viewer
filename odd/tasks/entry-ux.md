@@ -78,6 +78,6 @@ UX pass published at https://claude.ai/artifact/4RHTdmE23w8tzbB9FyZ5GS; user ask
 - `cargo test` at `b9850dd`: 143 lib + 6 + 1 passed, 1 ignored. Clippy clean, rustfmt clean on touched files.
 
 ## Next step
-1. T4 done; re-run `gentle-ai review assess` on `b9850dd` per the ODD review-due protocol before considering this range delivery-ready.
+1. T4 assessed (medium, under_budget); review stays pending in the slice until the PR is prepared or the budget is reached.
 2. Slice PRs per `stacked-to-main` (T1 = `c7bfb27`; T2 = `a1858c0`; T3 = `7d2b6ea` + `ca21665`; T4 = `b9850dd`) — push/PR is the user's decision.
 3. Optional follow-ups: the advisory findings above.
