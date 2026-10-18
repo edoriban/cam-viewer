@@ -2,7 +2,7 @@
 //! process-backed probe pool (spec REQ-6, REQ-7, REQ-9, REQ-10).
 
 use crate::discover::scan::Responder;
-use crate::discover::{RowStatus, DiscoveryResult};
+use crate::discover::{DiscoveryResult, RowStatus};
 use crate::stream::{self, ProbeOutcome};
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -26,7 +26,14 @@ pub const MAX_ATTEMPTS_PER_HOST: usize = VENDOR_PATHS.len();
 pub const PROBE_WORKERS: usize = 16;
 
 /// Per-attempt deadline handed to [`stream::probe_rtsp`].
-pub const DISCOVER_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+///
+/// A successful probe includes the RTSP handshake plus stream analysis, which
+/// measured 2-4 s on real Wi-Fi cameras with outliers past 7 s. At 4 s the
+/// deadline killed working probes, the timeout was read as Unreachable, and a
+/// camera on a known path was reported as "stream path not recognised".
+/// Wrong paths still fail fast with a 404, so only real successes and dead
+/// ports pay the longer wait.
+pub const DISCOVER_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Data-driven vendor path table: `(vendor label, RTSP path)`. New vendors
 /// are one table row; candidate generation needs no logic change (REQ-7).
@@ -344,6 +351,18 @@ mod policy_tests {
     fn scripted(outcomes: Vec<ProbeOutcome>) -> impl FnMut(&str) -> ProbeOutcome {
         let mut outcomes = outcomes;
         move |_: &str| outcomes.remove(0)
+    }
+
+    #[test]
+    fn probe_deadline_outlasts_a_slow_but_successful_camera_handshake() {
+        // Measured on real Wi-Fi cameras: a successful ffprobe of a valid
+        // path took 2.1-4.0 s, with an outlier at 7.1 s. A deadline at or
+        // under that kills the probe and reports a working path as failed.
+        assert!(
+            super::DISCOVER_PROBE_TIMEOUT >= std::time::Duration::from_secs(8),
+            "deadline {:?} kills slow successful probes",
+            super::DISCOVER_PROBE_TIMEOUT
+        );
     }
 
     #[test]
