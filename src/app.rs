@@ -2459,7 +2459,7 @@ fn show_solo(
                     bottom: 18,
                 }),
         )
-        .show(ctx, |ui| instrument_row(ui, cam, camera_index));
+        .show(ctx, |ui| instrument_row(ui, cam));
 
     egui::CentralPanel::default()
         .frame(
@@ -2486,7 +2486,10 @@ fn show_solo(
     back
 }
 
-fn instrument_row(ui: &mut egui::Ui, cam: &CameraView, camera_index: usize) {
+/// Read-only facts about the solo camera. Mute and record live on the video
+/// surface above, exactly as on grid tiles; drawing them here too put a
+/// second pair on top of the STATUS and SOURCE labels.
+fn instrument_row(ui: &mut egui::Ui, cam: &CameraView) {
     let width = ui.available_width();
     let height = 56.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
@@ -2497,35 +2500,6 @@ fn instrument_row(ui: &mut egui::Ui, cam: &CameraView, camera_index: usize) {
         0.0,
         egui::Stroke::new(2.0_f32, theme::INK),
         egui::StrokeKind::Inside,
-    );
-
-    let is_muted = cam.stream.muted();
-    let mute_text = if is_muted { "MUTE" } else { "UNMUTE" };
-    let mute_rect = theme::chip_rect(
-        &painter,
-        egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
-        mute_text,
-    );
-    let mute_response = ui.interact(
-        mute_rect,
-        egui::Id::new(("solo_instrument_mute", camera_index)),
-        egui::Sense::click(),
-    );
-    if mute_response.clicked() {
-        cam.stream.set_muted(!is_muted);
-    }
-    let mute_fg = if is_muted {
-        theme::STATUS_OFFLINE
-    } else {
-        theme::STATUS_ONLINE
-    };
-    theme::draw_chip(&painter, mute_rect, mute_text, mute_fg, theme::SOOT_2);
-
-    recording_control(
-        ui,
-        cam,
-        rect,
-        egui::Id::new(("solo_instrument", camera_index)),
     );
 
     let status = cam.stream.status();
@@ -2909,6 +2883,71 @@ mod tests {
             resolution: None,
             auth,
         }
+    }
+
+    /// Clickable widgets the solo view registers, in reading order, after a
+    /// real egui pass at a fixed screen size.
+    fn solo_view_click_targets() -> Vec<egui::Rect> {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut cam = CameraView {
+            name: "Cochera".to_owned(),
+            url: "rtsp://127.0.0.1:1/none".to_owned(),
+            stream: StreamHandle::spawn("rtsp://127.0.0.1:1/none", true),
+            texture: None,
+        };
+        // Fonts installed with set_fonts only take effect on the next pass.
+        let _ = ctx.run(input(), |_| {});
+        let mut targets = Vec::new();
+        let _ = ctx.run(input(), |ctx| {
+            show_solo(ctx, &mut cam, 0, BadgePosition::default());
+            targets = ctx.viewport(|viewport| {
+                viewport
+                    .this_pass
+                    .widgets
+                    .layers()
+                    .flat_map(|(_, widgets)| widgets.iter())
+                    .filter(|widget| widget.sense.senses_click())
+                    .map(|widget| widget.rect)
+                    .collect()
+            });
+        });
+        cam.stream.stop();
+        targets
+    }
+
+    #[test]
+    fn solo_view_offers_mute_and_record_once_on_the_video_not_in_the_instrument_strip() {
+        // The instrument strip used to draw its own MUTE and RECORD chips on
+        // top of its STATUS and SOURCE labels, duplicating the pair the video
+        // surface already shows.
+        let strip_top = 800.0 - 100.0;
+        let targets = solo_view_click_targets();
+        let in_strip: Vec<&egui::Rect> = targets
+            .iter()
+            .filter(|rect| rect.top() >= strip_top)
+            .collect();
+        assert!(
+            in_strip.is_empty(),
+            "instrument strip must be read-only, found controls at {in_strip:?}"
+        );
+        // The video surface keeps its pair: two chip-sized controls below
+        // the top bar (which holds BACK) and above the strip.
+        let chips_on_video = targets
+            .iter()
+            .filter(|rect| rect.top() > 60.0 && rect.top() < strip_top && rect.height() < 30.0)
+            .count();
+        assert_eq!(
+            chips_on_video, 2,
+            "expected MUTE and RECORD on the video: {targets:?}"
+        );
     }
 
     #[test]
