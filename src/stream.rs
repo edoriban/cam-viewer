@@ -1,4 +1,5 @@
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,8 +45,28 @@ pub struct Frame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordingState {
     Idle,
-    Recording,
+    Recording { path: PathBuf, started: Instant },
+    Saving { path: PathBuf },
+    Saved { path: PathBuf, at: Instant },
     Failed(String),
+}
+
+/// Bound on how long `stop()` (app shutdown / `Drop`) waits for ffmpeg to
+/// finish writing the file after asking it to quit, before giving up and
+/// killing it.
+const RECORDING_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+/// Same bound for an interactive STOP click, backgrounded so the UI stays
+/// responsive while ffmpeg finalizes the file.
+const RECORDING_FINISH_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// A running recorder: the ffmpeg child plus the plumbing `finish_recording`
+/// needs to stop it cleanly and judge the outcome.
+struct Recorder {
+    child: Child,
+    path: PathBuf,
+    started: Instant,
+    stderr_tail: Arc<Mutex<String>>,
+    stderr_thread: thread::JoinHandle<()>,
 }
 
 #[derive(Clone)]
@@ -57,7 +78,7 @@ struct Shared {
     paused: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
     url: String,
-    recording: Arc<Mutex<Option<Child>>>,
+    recorder: Arc<Mutex<Option<Recorder>>>,
     recording_state: Arc<Mutex<RecordingState>>,
     audio_child: Arc<Mutex<Option<Child>>>,
     /// Reconnect attempts since the last successfully published frame; reset
@@ -94,7 +115,7 @@ impl StreamHandle {
             paused: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(muted)),
             url: url.clone(),
-            recording: Arc::new(Mutex::new(None)),
+            recorder: Arc::new(Mutex::new(None)),
             recording_state: Arc::new(Mutex::new(RecordingState::Idle)),
             audio_child: Arc::new(Mutex::new(None)),
             attempts: Arc::new(AtomicU32::new(0)),
@@ -153,7 +174,7 @@ impl StreamHandle {
 
     pub fn stop(&self) {
         self.shared.shutdown.store(true, Ordering::Relaxed);
-        self.stop_recording();
+        self.finish_recording_sync(RECORDING_STOP_TIMEOUT);
         stop_child(&self.shared.child);
         stop_child(&self.shared.audio_child);
     }
@@ -170,82 +191,108 @@ impl StreamHandle {
         self.shared.muted.load(Ordering::Relaxed)
     }
 
+    /// Polls the recording child, if any, and settles an unrequested exit
+    /// (ffmpeg dying or refusing to start) into `Failed` before returning the
+    /// current state. Called every frame by the UI.
     pub fn recording_state(&self) -> RecordingState {
-        let mut child_slot = lock(&self.shared.recording);
-        if let Some(child) = child_slot.as_mut() {
-            match child.try_wait() {
-                Ok(None) => {}
-                Ok(Some(status)) => {
-                    child_slot.take();
-                    let mut state = lock(&self.shared.recording_state);
-                    *state = if status.success() {
-                        RecordingState::Idle
-                    } else {
-                        RecordingState::Failed("ffmpeg recording exited with an error".to_owned())
-                    };
-                }
-                Err(error) => {
-                    child_slot.take();
-                    *lock(&self.shared.recording_state) =
-                        RecordingState::Failed(format!("checking recording process: {error}"));
-                }
-            }
+        let mut slot = lock(&self.shared.recorder);
+        if let Some(recorder) = slot.as_mut()
+            && let Ok(Some(status)) = recorder.child.try_wait()
+        {
+            let tail = lock(&recorder.stderr_tail).clone();
+            let settled = settle_exit(&recorder.path, status.success(), false, &tail);
+            slot.take();
+            *lock(&self.shared.recording_state) = settled;
         }
         lock(&self.shared.recording_state).clone()
+    }
+
+    /// Shows why a recording could not even be started (for example, its
+    /// folder could not be created). Ignored while a recording is running.
+    pub fn report_recording_error(&self, message: String) {
+        if lock(&self.shared.recorder).is_none() {
+            *lock(&self.shared.recording_state) = RecordingState::Failed(message);
+        }
     }
 
     pub fn start_recording(&self, path: impl Into<String>) -> Result<(), String> {
         // Keep the duplicate check, process creation, and child publication
         // under one mutex. Otherwise two callers can both observe Idle and
         // spawn separate ffmpeg children before either publishes its child.
-        let mut recording = lock(&self.shared.recording);
-        if let Some(child) = recording.as_mut() {
-            match child.try_wait() {
-                Ok(None) => {
-                    *lock(&self.shared.recording_state) = RecordingState::Recording;
-                    return Ok(());
-                }
-                Ok(Some(status)) => {
-                    recording.take();
-                    *lock(&self.shared.recording_state) = if status.success() {
-                        RecordingState::Idle
-                    } else {
-                        RecordingState::Failed("ffmpeg recording exited with an error".to_owned())
-                    };
-                }
-                Err(error) => {
-                    recording.take();
-                    *lock(&self.shared.recording_state) =
-                        RecordingState::Failed(format!("checking recording process: {error}"));
-                }
-            }
+        let mut slot = lock(&self.shared.recorder);
+
+        if let Some(recorder) = slot.as_mut()
+            && let Ok(Some(status)) = recorder.child.try_wait()
+        {
+            let tail = lock(&recorder.stderr_tail).clone();
+            let settled = settle_exit(&recorder.path, status.success(), false, &tail);
+            slot.take();
+            *lock(&self.shared.recording_state) = settled;
         }
 
-        let path = path.into();
-        let muted = self.shared.muted.load(Ordering::Relaxed);
-        let mut command = no_window_command("ffmpeg");
-        command.args(["-nostdin", "-v", "error", "-rtsp_transport", "tcp"]);
-        command.args(["-i", &self.shared.url, "-map", "0:v:0"]);
-        if !muted {
-            command.args(["-map", "0:a?"]);
+        if let Some(recorder) = slot.as_ref() {
+            // Already recording: idempotent, matching the previous state.
+            *lock(&self.shared.recording_state) = RecordingState::Recording {
+                path: recorder.path.clone(),
+                started: recorder.started,
+            };
+            return Ok(());
         }
-        command.args(["-c", "copy", "-f", "mp4", &path]);
-        let child = match command.spawn() {
-            Ok(child) => child,
+
+        if matches!(
+            *lock(&self.shared.recording_state),
+            RecordingState::Saving { .. }
+        ) {
+            return Err("a recording is still being saved".to_owned());
+        }
+
+        let path = PathBuf::from(path.into());
+        let args = recording_args(&self.shared.url, &path);
+        let recorder = match spawn_recorder(&args, path.clone()) {
+            Ok(recorder) => recorder,
             Err(error) => {
-                let message = format!("starting recording: {error}");
-                *lock(&self.shared.recording_state) = RecordingState::Failed(message.clone());
-                return Err(message);
+                *lock(&self.shared.recording_state) = RecordingState::Failed(error.clone());
+                return Err(error);
             }
         };
-        *recording = Some(child);
-        *lock(&self.shared.recording_state) = RecordingState::Recording;
+        let started = recorder.started;
+        *slot = Some(recorder);
+        *lock(&self.shared.recording_state) = RecordingState::Recording { path, started };
         Ok(())
     }
 
+    /// Takes the recorder off the shared slot, publishes `Saving`
+    /// immediately, and finishes ffmpeg on a background thread so the UI
+    /// stays responsive while the file is finalized.
     pub fn stop_recording(&self) {
-        stop_child(&self.shared.recording);
-        *lock(&self.shared.recording_state) = RecordingState::Idle;
+        let Some(recorder) = lock(&self.shared.recorder).take() else {
+            return;
+        };
+        *lock(&self.shared.recording_state) = RecordingState::Saving {
+            path: recorder.path.clone(),
+        };
+        let state_slot = Arc::clone(&self.shared.recording_state);
+        thread::Builder::new()
+            .name("cam-recorder-finish".to_owned())
+            .spawn(move || {
+                let settled = finish_recording(recorder, RECORDING_FINISH_TIMEOUT);
+                *lock(&state_slot) = settled;
+            })
+            .expect("failed to spawn recorder-finish thread");
+    }
+
+    /// Same as `stop_recording`, but finishes synchronously: used by `stop()`
+    /// (app shutdown / `Drop`), where the process may exit right after and a
+    /// backgrounded finish would never get to run.
+    fn finish_recording_sync(&self, timeout: Duration) {
+        let Some(recorder) = lock(&self.shared.recorder).take() else {
+            return;
+        };
+        *lock(&self.shared.recording_state) = RecordingState::Saving {
+            path: recorder.path.clone(),
+        };
+        let settled = finish_recording(recorder, timeout);
+        *lock(&self.shared.recording_state) = settled;
     }
 
     pub fn grab_start(&self, path: impl Into<String>) -> Result<(), String> {
@@ -293,6 +340,147 @@ fn stop_child(child_slot: &Mutex<Option<Child>>) {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// ffmpeg arguments for a recording (S1/S5): `-n` refuses to clobber an
+/// existing file (names are unique already, this is a last-resort guard),
+/// audio is always mapped regardless of the camera's mute state, and the
+/// mixed codecs (copy video, re-encode audio to AAC) are what MP4 can carry
+/// from a camera that typically sends G.711. No `-nostdin`: stdin is how
+/// `finish_recording` asks ffmpeg to stop cleanly.
+fn recording_args(url: &str, path: &Path) -> Vec<String> {
+    let timeout = STREAM_IO_TIMEOUT.as_micros().to_string();
+    let path_str = path.display().to_string();
+    [
+        "-v",
+        "error",
+        "-n",
+        "-rtsp_transport",
+        "tcp",
+        "-timeout",
+        timeout.as_str(),
+        "-i",
+        url,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-f",
+        "mp4",
+        path_str.as_str(),
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+/// Spawns ffmpeg for a recording: stdin piped (so `finish_recording` can send
+/// `q`), stdout discarded, and stderr piped to a thread that keeps only the
+/// last non-empty line so the pipe never fills and backs ffmpeg up.
+fn spawn_recorder(args: &[String], path: PathBuf) -> Result<Recorder, String> {
+    let mut command = no_window_command("ffmpeg");
+    command.args(args);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("starting recording: {error}"))?;
+    let stderr = child.stderr.take().expect("stderr piped above");
+    let stderr_tail = Arc::new(Mutex::new(String::new()));
+    let tail_for_thread = Arc::clone(&stderr_tail);
+    let stderr_thread = thread::Builder::new()
+        .name("cam-recorder-stderr".to_owned())
+        .spawn(move || drain_stderr(stderr, &tail_for_thread))
+        .expect("failed to spawn recorder-stderr thread");
+    Ok(Recorder {
+        child,
+        path,
+        started: Instant::now(),
+        stderr_tail,
+        stderr_thread,
+    })
+}
+
+fn drain_stderr(stderr: impl Read, tail: &Mutex<String>) {
+    let reader = BufReader::new(stderr);
+    for line in reader.lines().map_while(Result::ok) {
+        if !line.trim().is_empty() {
+            *lock(tail) = line;
+        }
+    }
+}
+
+/// Judges what a finished ffmpeg recording child amounts to. `success` (the
+/// process exit status) is deliberately not used to decide between Saved and
+/// Failed: an exit nobody asked for is a failure even at status 0 (e.g.
+/// ffmpeg's own `-n` "file already exists" refusal), and a requested stop is
+/// judged by whether a non-empty file actually landed on disk, since a
+/// `q`-triggered stop's exit code is not a reliable signal either way.
+fn settle_exit(path: &Path, _success: bool, requested: bool, stderr_tail: &str) -> RecordingState {
+    if !requested {
+        return if stderr_tail.is_empty() {
+            RecordingState::Failed("recording stopped unexpectedly".to_owned())
+        } else {
+            RecordingState::Failed(stderr_tail.to_owned())
+        };
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > 0 => RecordingState::Saved {
+            path: path.to_path_buf(),
+            at: Instant::now(),
+        },
+        _ => RecordingState::Failed("nothing was recorded".to_owned()),
+    }
+}
+
+/// Stops a recorder cleanly (S1): sends `q` on stdin, drops it, and polls
+/// `try_wait` until `timeout`. SIGKILL is only a last resort, since a killed
+/// ffmpeg may leave the MP4 unfinalized.
+fn finish_recording(mut recorder: Recorder, timeout: Duration) -> RecordingState {
+    if let Some(mut stdin) = recorder.child.stdin.take() {
+        let _ = stdin.write_all(b"q");
+    }
+    let deadline = Instant::now() + timeout;
+    let mut exit_status = None;
+    loop {
+        match recorder.child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => break,
+        }
+    }
+    let killed = exit_status.is_none();
+    if killed {
+        let _ = recorder.child.kill();
+        let _ = recorder.child.wait();
+    }
+    let _ = recorder.stderr_thread.join();
+    let tail = lock(&recorder.stderr_tail).clone();
+    if killed {
+        let suffix = if tail.is_empty() {
+            String::new()
+        } else {
+            format!(": {tail}")
+        };
+        return RecordingState::Failed(format!(
+            "recording did not stop in time and was force-stopped; the file may be incomplete{suffix}"
+        ));
+    }
+    let success = exit_status.expect("checked above").success();
+    settle_exit(&recorder.path, success, true, &tail)
 }
 
 /// Sleeps up to `total`, waking early on shutdown, pause, or `retry_wake`
@@ -553,8 +741,7 @@ fn run_loop(shared: Shared, url: &str) {
 
 /// Mirrors `run_loop`'s reconnect lifecycle for a second, independent ffmpeg
 /// process that decodes only the audio track and plays it through the
-/// default output device. Gated by the same `muted` flag the recording
-/// pipeline already reads, so unmuting a camera does both at once.
+/// default output device. Gated by the `muted` flag.
 fn audio_loop(shared: Shared, url: &str) {
     loop {
         if shared.shutdown.load(Ordering::Relaxed) {
@@ -778,7 +965,7 @@ mod ppm_tests {
             paused: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(true)),
             url: "rtsp://127.0.0.1:1/none".to_owned(),
-            recording: Arc::new(Mutex::new(None)),
+            recorder: Arc::new(Mutex::new(None)),
             recording_state: Arc::new(Mutex::new(super::RecordingState::Idle)),
             audio_child: Arc::new(Mutex::new(None)),
             attempts: Arc::new(AtomicU32::new(0)),
@@ -929,12 +1116,27 @@ mod ppm_tests {
         assert!(
             handle
                 .shared
-                .recording
+                .recorder
                 .lock()
-                .expect("recording lock")
+                .expect("recorder lock")
                 .is_some()
         );
         handle.stop_recording();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(
+            handle.recording_state(),
+            super::RecordingState::Saving { .. }
+        ) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !matches!(
+                handle.recording_state(),
+                super::RecordingState::Recording { .. }
+            ),
+            "stop must not leave the state Recording"
+        );
         handle.stop();
     }
 
@@ -1083,10 +1285,24 @@ mod ppm_tests {
         );
         assert!(matches!(
             handle.recording_state(),
-            super::RecordingState::Recording | super::RecordingState::Failed(_)
+            super::RecordingState::Recording { .. } | super::RecordingState::Failed(_)
         ));
         handle.stop_recording();
-        assert_eq!(handle.recording_state(), super::RecordingState::Idle);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(
+            handle.recording_state(),
+            super::RecordingState::Saving { .. }
+        ) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !matches!(
+                handle.recording_state(),
+                super::RecordingState::Recording { .. }
+            ),
+            "stop must not leave the state Recording"
+        );
         handle.stop();
     }
 }
@@ -1256,5 +1472,147 @@ mod tests {
             timeout + Duration::from_secs(1)
         );
         holder.join().expect("holder thread finishes");
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::{RecordingState, finish_recording, recording_args, settle_exit, spawn_recorder};
+
+    #[test]
+    fn a_recording_that_cannot_start_reports_why() {
+        let handle = super::StreamHandle::spawn("rtsp://127.0.0.1:1/none", true);
+        handle.report_recording_error("creating /x: permission denied".to_owned());
+        assert_eq!(
+            handle.recording_state(),
+            RecordingState::Failed("creating /x: permission denied".to_owned())
+        );
+        handle.stop();
+    }
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::Duration;
+
+    fn ffmpeg_available() -> bool {
+        Command::new("ffmpeg").arg("-version").output().is_ok()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("cam-viewer-rec-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn recordings_keep_audio_whatever_the_mute_state() {
+        let args = recording_args("rtsp://cam/live", Path::new("/tmp/out.mp4"));
+        let joined = args.join(" ");
+        assert!(joined.contains("-map 0:v:0 -map 0:a?"), "{joined}");
+        // Cameras often send G.711, which MP4 cannot carry as-is.
+        assert!(joined.contains("-c:v copy -c:a aac"), "{joined}");
+    }
+
+    #[test]
+    fn recordings_never_overwrite_and_never_wait_forever_on_input() {
+        let args = recording_args("rtsp://cam/live", Path::new("/tmp/out.mp4"));
+        assert!(args.iter().any(|a| a == "-n"), "{args:?}");
+        assert!(args.iter().any(|a| a == "-timeout"), "{args:?}");
+        // stdin carries the `q` that finishes the file cleanly.
+        assert!(!args.iter().any(|a| a == "-nostdin"), "{args:?}");
+        assert_eq!(args.last().map(String::as_str), Some("/tmp/out.mp4"));
+    }
+
+    #[test]
+    fn an_exit_nobody_asked_for_is_a_failure_even_with_status_zero() {
+        // ffmpeg exits 0 after "File 'x' already exists. Exiting."
+        let state = settle_exit(
+            Path::new("/nope.mp4"),
+            true,
+            false,
+            "File 'x' already exists. Exiting.",
+        );
+        assert_eq!(
+            state,
+            RecordingState::Failed("File 'x' already exists. Exiting.".to_owned())
+        );
+        let state = settle_exit(Path::new("/nope.mp4"), false, false, "");
+        assert_eq!(
+            state,
+            RecordingState::Failed("recording stopped unexpectedly".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_requested_stop_with_no_file_reports_that_nothing_was_recorded() {
+        let state = settle_exit(Path::new("/definitely/missing.mp4"), true, true, "");
+        assert_eq!(
+            state,
+            RecordingState::Failed("nothing was recorded".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_requested_stop_with_a_file_is_saved() {
+        let dir = scratch("saved");
+        let path = dir.join("ok.mp4");
+        std::fs::write(&path, b"data").expect("file");
+        assert!(matches!(
+            settle_exit(&path, true, true, ""),
+            RecordingState::Saved { path: saved, .. } if saved == path
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finishing_a_recording_leaves_a_file_ffprobe_can_read() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not available, skipping");
+            return;
+        }
+        let dir = scratch("finish");
+        let path = dir.join("clip.mp4");
+        let args: Vec<String> = [
+            "-v",
+            "error",
+            "-n",
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=160x120:rate=15",
+            "-c:v",
+            "libx264",
+            "-f",
+            "mp4",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain([path.display().to_string()])
+        .collect();
+        let recorder = spawn_recorder(&args, path.clone()).expect("spawn ffmpeg");
+        std::thread::sleep(Duration::from_millis(1500));
+        let state = finish_recording(recorder, Duration::from_secs(5));
+        assert!(matches!(state, RecordingState::Saved { .. }), "{state:?}");
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&path)
+            .output()
+            .expect("run ffprobe");
+        assert!(
+            probe.status.success(),
+            "{}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "video");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

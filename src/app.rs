@@ -1973,6 +1973,12 @@ fn draw_grid_rows(
 // Video surface (shared by grid tiles and solo stage)
 // ---------------------------------------------------------------------------
 
+/// The mute chip names the action a click performs; its color shows the
+/// current state.
+fn mute_chip_label(muted: bool) -> &'static str {
+    if muted { "UNMUTE" } else { "MUTE" }
+}
+
 fn video_surface(
     ui: &mut egui::Ui,
     cam: &mut CameraView,
@@ -1985,24 +1991,6 @@ fn video_surface(
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme::SOOT_2);
-
-    let is_muted = cam.stream.muted();
-    let mute_text = if is_muted { "MUTE" } else { "UNMUTE" };
-    let mute_rect = theme::chip_rect(
-        &painter,
-        egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
-        mute_text,
-    );
-    let mute_response = ui.interact(mute_rect, surface_id.with("mute"), egui::Sense::click());
-    if mute_response.clicked() {
-        cam.stream.set_muted(!is_muted);
-    }
-    let mute_fg = if is_muted {
-        theme::STATUS_OFFLINE
-    } else {
-        theme::STATUS_ONLINE
-    };
-    theme::draw_chip(&painter, mute_rect, mute_text, mute_fg, theme::SOOT_2);
 
     // Measured up front (T4b) so the phase band below can reserve this area
     // instead of colliding with the badge drawn later, in the `overlays`
@@ -2051,7 +2039,7 @@ fn video_surface(
         }
     }
 
-    recording_control(ui, cam, rect, surface_id);
+    let controls_left_edge = tile_controls(ui, cam, rect, badge_rect_for_band, surface_id);
 
     let hovered = response.hovered();
     let border = if overlays && hovered {
@@ -2069,7 +2057,13 @@ fn video_surface(
     if overlays {
         let name_font = theme::mono_font(12.5);
         let name_pos = rect.left_top() + egui::vec2(12.0, 10.0);
-        let name_max_w = (rect.width() * 0.6).max(40.0);
+        // Capped so the name never reaches the top-right controls (S3); the
+        // controls themselves are already clear of a TopRight badge, so
+        // staying left of them keeps the name clear of it too.
+        let name_max_w = match controls_left_edge {
+            Some(left) => (left - name_pos.x - 10.0).max(40.0),
+            None => (rect.width() * 0.6).max(40.0),
+        };
         let shown_name = theme::elide_to_width(
             &painter,
             &cam.name,
@@ -2236,62 +2230,220 @@ fn offline_tile(ui: &mut egui::Ui, rect: egui::Rect, cam: &CameraView, surface_i
     theme::draw_chip(&painter, retry_rect, label, fg, bg);
 }
 
-fn recording_control(ui: &mut egui::Ui, cam: &CameraView, rect: egui::Rect, surface_id: egui::Id) {
-    let mut state = cam.stream.recording_state();
-    let active = state == crate::stream::RecordingState::Recording;
-    let painter = ui.painter_at(rect);
+/// Inset of the top-right control group (MUTE + RECORD, S3) from the tile
+/// edge, and the gap between the two chips.
+const TILE_CONTROLS_INSET: f32 = 8.0;
+const TILE_CONTROLS_GAP: f32 = 6.0;
+/// Minimum gap kept between the controls and a badge they moved to avoid.
+const TILE_CONTROLS_BADGE_CLEARANCE: f32 = 6.0;
+/// How long a SAVED notice stays up before the chip reads like Idle again
+/// (S2). Purely a display decision: the stored `RecordingState` is
+/// untouched, so re-reading it right after a save still reports `Saved`.
+const SAVED_NOTICE_DURATION: Duration = Duration::from_secs(8);
 
-    let text = match &state {
-        crate::stream::RecordingState::Failed(error) => theme::elide_to_width(
-            &painter,
+/// MUTE is only meaningful once a stream has a frame to mute (S4).
+fn mute_control_visible(has_frame: bool) -> bool {
+    has_frame
+}
+
+/// RECORD needs a frame to start a new recording (S4), but a recording
+/// already under way (or one whose outcome still needs to be read) must stay
+/// reachable even if the frame disappears afterward.
+fn record_control_visible(has_frame: bool, state: &crate::stream::RecordingState) -> bool {
+    has_frame || !matches!(state, crate::stream::RecordingState::Idle)
+}
+
+/// Right edge the top-right control group should align to: the tile's
+/// default inset, or clear of `badge_rect` when it would otherwise collide
+/// with it. Purely geometric (mirrors `band_rect`), so a BottomRight badge,
+/// which never shares the top row the controls occupy, is naturally left
+/// alone.
+fn controls_right_edge(
+    tile: egui::Rect,
+    badge_rect: Option<egui::Rect>,
+    controls_size: egui::Vec2,
+) -> f32 {
+    let default_right = tile.right() - TILE_CONTROLS_INSET;
+    if let Some(badge) = badge_rect {
+        let top = tile.top() + TILE_CONTROLS_INSET;
+        let bottom = top + controls_size.y;
+        let left = default_right - controls_size.x;
+        let vertical_overlap = badge.top() < bottom && badge.bottom() > top;
+        let horizontal_overlap = badge.left() < default_right && badge.right() > left;
+        if vertical_overlap && horizontal_overlap {
+            return badge.left() - TILE_CONTROLS_BADGE_CLEARANCE;
+        }
+    }
+    default_right
+}
+
+/// Chip text for the current recording state (S1/S2).
+fn recording_chip_text(painter: &egui::Painter, state: &crate::stream::RecordingState) -> String {
+    use crate::stream::RecordingState;
+    let dot = '\u{b7}';
+    let ellipsis = '\u{2026}';
+    match state {
+        RecordingState::Idle => "RECORD".to_owned(),
+        RecordingState::Recording { started, .. } => {
+            let elapsed = started.elapsed();
+            format!(
+                "REC {:02}:{:02}",
+                elapsed.as_secs() / 60,
+                elapsed.as_secs() % 60
+            )
+        }
+        RecordingState::Saving { .. } => format!("SAVING{ellipsis}"),
+        RecordingState::Saved { path, .. } => {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("recording");
+            format!("SAVED {dot} {name}")
+        }
+        RecordingState::Failed(error) => theme::elide_to_width(
+            painter,
             &format!("RECORD FAILED: {error}"),
             theme::mono_font(10.0),
             170.0,
             theme::STATUS_OFFLINE,
         ),
-        _ if active => "STOP".to_owned(),
-        _ => "RECORD".to_owned(),
-    };
+    }
+}
 
-    let inset = 8.0;
-    let size = theme::chip_rect(&painter, egui::pos2(0.0, 0.0), &text).size();
-    let control_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.right() - inset - size.x, rect.top() + inset),
-        size,
-    );
-    let response = ui.interact(
-        control_rect,
-        surface_id.with("recording"),
-        egui::Sense::click(),
-    );
+fn draw_recording_chip(
+    ui: &mut egui::Ui,
+    cam: &CameraView,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    state: &crate::stream::RecordingState,
+    surface_id: egui::Id,
+) {
+    use crate::stream::RecordingState;
+    let response = ui.interact(rect, surface_id.with("recording"), egui::Sense::click());
     if response.clicked() {
-        if active {
-            cam.stream.stop_recording();
-        } else {
-            let filename = cam.name.replace(['/', '\\', ' '], "_");
-            if let Err(error) = cam
-                .stream
-                .start_recording(format!("{filename}-recording.mp4"))
-            {
-                // StreamHandle stores the exact error in RecordingState so it
-                // is rendered on the next frame and available on hover.
-                state = cam.stream.recording_state();
-                debug_assert!(matches!(
-                    &state,
-                    crate::stream::RecordingState::Failed(message) if message == &error
-                ));
+        match state {
+            RecordingState::Recording { .. } => cam.stream.stop_recording(),
+            RecordingState::Saved { path, .. } => {
+                if let Some(parent) = path.parent() {
+                    open_in_os_default_app(parent);
+                }
+            }
+            RecordingState::Saving { .. } => {}
+            RecordingState::Idle | RecordingState::Failed(_) => {
+                match crate::recordings::prepare(&cam.name) {
+                    Ok(path) => {
+                        let _ = cam.stream.start_recording(path.display().to_string());
+                    }
+                    Err(error) => cam.stream.report_recording_error(error),
+                }
             }
         }
     }
 
-    let fg = match &state {
-        crate::stream::RecordingState::Idle => theme::PAPER,
+    let text = recording_chip_text(painter, state);
+    let fg = match state {
+        RecordingState::Idle => theme::PAPER,
         _ => theme::STATUS_OFFLINE,
     };
-    theme::draw_chip(&painter, control_rect, &text, fg, theme::SOOT_2);
-    if let crate::stream::RecordingState::Failed(error) = &state {
+    theme::draw_chip(painter, rect, &text, fg, theme::SOOT_2);
+    if let RecordingState::Failed(error) = state {
         response.on_hover_text(error);
     }
+}
+
+/// Draws the top-right MUTE + RECORD control group (S3/S4), after the frame
+/// so it is never drawn under it. Returns the left edge of whatever was
+/// drawn, so the name overlay can stay clear of it; `None` when neither
+/// control is visible.
+fn tile_controls(
+    ui: &mut egui::Ui,
+    cam: &CameraView,
+    rect: egui::Rect,
+    badge_rect: Option<egui::Rect>,
+    surface_id: egui::Id,
+) -> Option<f32> {
+    let has_frame = cam.stream.has_frame();
+    let mut state = cam.stream.recording_state();
+    if let crate::stream::RecordingState::Saved { at, .. } = &state
+        && at.elapsed() > SAVED_NOTICE_DURATION
+    {
+        state = crate::stream::RecordingState::Idle;
+    }
+
+    let mute_visible = mute_control_visible(has_frame);
+    let record_visible = record_control_visible(has_frame, &state);
+    if !mute_visible && !record_visible {
+        return None;
+    }
+
+    let is_muted = cam.stream.muted();
+    let mute_text = mute_chip_label(is_muted);
+    let painter = ui.painter_at(rect);
+    let mute_size = theme::chip_rect(&painter, egui::pos2(0.0, 0.0), mute_text).size();
+    let record_text = recording_chip_text(&painter, &state);
+    let record_size = theme::chip_rect(&painter, egui::pos2(0.0, 0.0), &record_text).size();
+
+    let group_size = match (mute_visible, record_visible) {
+        (true, true) => egui::vec2(
+            mute_size.x + TILE_CONTROLS_GAP + record_size.x,
+            mute_size.y.max(record_size.y),
+        ),
+        (true, false) => mute_size,
+        (false, true) => record_size,
+        (false, false) => unreachable!("checked above"),
+    };
+    let right_edge = controls_right_edge(rect, badge_rect, group_size);
+    let top = rect.top() + TILE_CONTROLS_INSET;
+
+    let (mute_rect, record_rect) = match (mute_visible, record_visible) {
+        (true, true) => {
+            let record_rect =
+                egui::Rect::from_min_size(egui::pos2(right_edge - record_size.x, top), record_size);
+            let mute_rect = egui::Rect::from_min_size(
+                egui::pos2(record_rect.left() - TILE_CONTROLS_GAP - mute_size.x, top),
+                mute_size,
+            );
+            (Some(mute_rect), Some(record_rect))
+        }
+        (true, false) => (
+            Some(egui::Rect::from_min_size(
+                egui::pos2(right_edge - mute_size.x, top),
+                mute_size,
+            )),
+            None,
+        ),
+        (false, true) => (
+            None,
+            Some(egui::Rect::from_min_size(
+                egui::pos2(right_edge - record_size.x, top),
+                record_size,
+            )),
+        ),
+        (false, false) => unreachable!("checked above"),
+    };
+
+    if let Some(mute_rect) = mute_rect {
+        let response = ui.interact(mute_rect, surface_id.with("mute"), egui::Sense::click());
+        if response.clicked() {
+            cam.stream.set_muted(!is_muted);
+        }
+        let fg = if is_muted {
+            theme::STATUS_OFFLINE
+        } else {
+            theme::STATUS_ONLINE
+        };
+        theme::draw_chip(&painter, mute_rect, mute_text, fg, theme::SOOT_2);
+    }
+    if let Some(record_rect) = record_rect {
+        draw_recording_chip(ui, cam, &painter, record_rect, &state, surface_id);
+    }
+
+    Some(
+        mute_rect
+            .or(record_rect)
+            .expect("at least one is visible")
+            .left(),
+    )
 }
 
 /// Which phase band (if any) a tile shows for `status` given whether a frame
@@ -2924,10 +3076,17 @@ mod tests {
     }
 
     #[test]
-    fn solo_view_offers_mute_and_record_once_on_the_video_not_in_the_instrument_strip() {
+    fn mute_chip_label_names_the_action_a_click_performs() {
+        assert_eq!(mute_chip_label(true), "UNMUTE");
+        assert_eq!(mute_chip_label(false), "MUTE");
+    }
+
+    #[test]
+    fn solo_view_hides_mute_and_record_until_the_stream_has_a_frame() {
         // The instrument strip used to draw its own MUTE and RECORD chips on
         // top of its STATUS and SOURCE labels, duplicating the pair the video
-        // surface already shows.
+        // surface already shows. This camera never connects (S4): it has no
+        // frame, so the video must offer neither MUTE nor RECORD.
         let strip_top = 800.0 - 100.0;
         let targets = solo_view_click_targets();
         let in_strip: Vec<&egui::Rect> = targets
@@ -2938,15 +3097,16 @@ mod tests {
             in_strip.is_empty(),
             "instrument strip must be read-only, found controls at {in_strip:?}"
         );
-        // The video surface keeps its pair: two chip-sized controls below
-        // the top bar (which holds BACK) and above the strip.
+        // No chip-sized control should appear on the video below the top bar
+        // (which holds BACK) and above the strip: no frame means no MUTE and
+        // no RECORD (S4).
         let chips_on_video = targets
             .iter()
             .filter(|rect| rect.top() > 60.0 && rect.top() < strip_top && rect.height() < 30.0)
             .count();
         assert_eq!(
-            chips_on_video, 2,
-            "expected MUTE and RECORD on the video: {targets:?}"
+            chips_on_video, 0,
+            "expected no MUTE/RECORD on a video with no frame: {targets:?}"
         );
     }
 
@@ -3747,6 +3907,85 @@ mod tests {
     fn band_rect_keeps_the_default_bottom_placement_without_a_badge() {
         let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 150.0));
         assert_eq!(band_rect(tile, None).bottom(), tile.bottom());
+    }
+
+    // -- S3/S4: tile controls (MUTE/RECORD) visibility and placement --------
+
+    #[test]
+    fn mute_control_is_hidden_until_a_frame_has_arrived() {
+        assert!(!mute_control_visible(false));
+        assert!(mute_control_visible(true));
+    }
+
+    #[test]
+    fn record_control_requires_a_frame_unless_a_recording_is_already_in_flight() {
+        use crate::stream::RecordingState;
+        assert!(!record_control_visible(false, &RecordingState::Idle));
+        assert!(record_control_visible(true, &RecordingState::Idle));
+        // A recording started while there was a frame must stay controllable
+        // (stoppable/readable) even if the frame later disappears.
+        assert!(record_control_visible(
+            false,
+            &RecordingState::Recording {
+                path: std::path::PathBuf::from("/tmp/x.mp4"),
+                started: std::time::Instant::now(),
+            }
+        ));
+        assert!(record_control_visible(
+            false,
+            &RecordingState::Saving {
+                path: std::path::PathBuf::from("/tmp/x.mp4"),
+            }
+        ));
+        assert!(record_control_visible(
+            false,
+            &RecordingState::Saved {
+                path: std::path::PathBuf::from("/tmp/x.mp4"),
+                at: std::time::Instant::now(),
+            }
+        ));
+        assert!(record_control_visible(
+            false,
+            &RecordingState::Failed("boom".to_owned())
+        ));
+    }
+
+    #[test]
+    fn controls_right_edge_hugs_the_tile_corner_without_a_badge() {
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 150.0));
+        let controls = egui::vec2(90.0, 20.0);
+        assert_eq!(
+            controls_right_edge(tile, None, controls),
+            tile.right() - 8.0
+        );
+    }
+
+    #[test]
+    fn controls_right_edge_moves_left_of_a_top_right_badge_that_would_overlap_it() {
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 150.0));
+        let controls = egui::vec2(90.0, 20.0);
+        // Occupies the same top-right corner the controls default to.
+        let badge = egui::Rect::from_min_size(egui::pos2(150.0, 10.0), egui::vec2(40.0, 16.0));
+
+        let right_edge = controls_right_edge(tile, Some(badge), controls);
+
+        assert!(
+            right_edge <= badge.left() - 1.0,
+            "controls must end clear of the badge, got {right_edge} vs badge {badge:?}"
+        );
+    }
+
+    #[test]
+    fn controls_right_edge_ignores_a_bottom_right_badge() {
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 150.0));
+        let controls = egui::vec2(90.0, 20.0);
+        // A bottom-right badge never shares the top row the controls occupy.
+        let badge = egui::Rect::from_min_size(egui::pos2(150.0, 130.0), egui::vec2(40.0, 16.0));
+
+        assert_eq!(
+            controls_right_edge(tile, Some(badge), controls),
+            tile.right() - 8.0
+        );
     }
 
     // -- T4c: offline message must not repeat the on-tile camera name, and --
