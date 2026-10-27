@@ -30,16 +30,19 @@ Branch `feat/ux-pass`; work-unit commits per lot; push/PR/merge remain the user'
     - `finish_recording(recorder, timeout) -> RecordingState`: write `q`, drop stdin, poll `try_wait` until timeout, SIGKILL only as last resort (→ Failed mentioning the file may be incomplete), join stderr thread, then `settle_exit(.., requested=true, ..)`.
     - `StreamHandle::recording_state()` polls the child each frame and settles unrequested exits. `start_recording(path)` idempotent while running (keep `concurrent_recording_starts_publish_at_most_one_child`), returns Err without changing state while `Saving`. `stop_recording()` takes the recorder, sets `Saving`, finishes on a background thread. `stop()` (shutdown/Drop) finishes synchronously with ~3s timeout.
     - app.rs `video_surface`/`recording_control`: name alone top-left; MUTE + RECORD grouped top-right (left of the badge when the badge is TopRight), drawn AFTER the frame; name elided so it never reaches the controls; controls hidden unless the stream has a frame (S4) — but a recording that is Recording/Saving/Saved/Failed keeps its chip so it can be stopped/read; RECORD calls `recordings::prepare(&cam.name)`; Recording chip shows `REC mm:ss` in STATUS_OFFLINE; Saving shows `SAVING…` (not clickable); Saved shows `SAVED · <file name>` for ~8s and click opens the folder (`open_in_os_default_app` on the parent dir); Failed shows the error elided with full text on hover. Keep `mute_chip_label` (action wording).
-- [ ] T2 — Lot B: S6, S7, S8. Route: gentle-ai-worker (context backstop). Commit: —
+- [x] T2 — Lot B: S6, S7, S8. Route: gentle-ai-worker (context backstop). Commit: `3baeebd`. Evidence: 176 lib passed; parent mutation check (settings_locked forced false) made 2 tests fail, incl. the on-disk save test. S7 has no dedicated test (UI text only).
   - S6 design: while `config_error` is set, Settings shows the camera list as locked (no rows, no + ADD CAMERA, SAVE disabled for camera changes) with the copy "Camera list is locked until the file loads." / "Fix the file and press RELOAD, or start a new list (your file is kept as cameras.toml.bak)."; START A NEW LIST unlocks editing for the session (saving then goes through the existing `save_guarded` backup). Badge position / update check stay editable only if saving them cannot write the camera list over the unreadable file — otherwise lock them too.
   - S7: CONNECTING tile center text and PAUSED message show only the state, never `cam.name`.
   - S8: raise `theme::ASH` and `ghost_text()` alpha so small text on SOOT/SOOT_2 reaches >= 4.5:1 (target around #9a9aa0); keep CONCRETE/PAPER unchanged.
-- [ ] T3 — Lot C: S9, S10, S11, S12. Route: gentle-ai-worker (context backstop). Commit: —
+- [x] T3 — Lot C: S9, S10, S11, S12. Route: gentle-ai-worker (context backstop). Commit: `ca425bd`. Evidence: 182 lib passed, each RED observed individually (S11 measured 1180 vs 1172 before fix).
   - S9: `segmented_row` selected = dark fill + red marker square + red bottom rule; unselected = transparent with CONCRETE border and ASH text; no paper fill or offset shadow on segments (those mean "action").
   - S10: sidebar summary with zero cameras reads "NO CAMERAS YET"; the separate CAMERAS list empty label must not duplicate it (drop or reword).
   - S11: welcome option cards end at the same right margin (18px) as grid tiles.
   - S12: welcome block centered vertically in the central panel.
-- [ ] T4 — Runtime visual check (Xvfb) + ffprobe of a stopped recording. Route: inline.
+- [x] T4 — Runtime visual check (Xvfb) + ffprobe of a stopped recording. Route: inline.
+  - Xvfb 1280x720 after-shots: grid tiles show name only, no MUTE/RECORD while offline; config-error Settings locked with START A NEW LIST, file bytes unchanged, no .bak; welcome centred, second card right edge 1261 vs grid 1262; sidebar NO CAMERAS YET.
+  - ffprobe: covered by `finishing_a_recording_leaves_a_file_ffprobe_can_read` (real ffmpeg, `q` stop, ffprobe reads video).
+  - NOT verified: live video with controls over a frame, REC/SAVING/SAVED chips, unlocked segmented control — no RTSP server available locally.
 
 ## Log
 - L1: "pasale ux pass y taste a la aplicación a ver qué se mejora" → "haz un artifact para poder ver tu propuesta de una manera mas visual" → decisions A, B, C; bug 01 = mp4-graceful; "vamos con esto".
