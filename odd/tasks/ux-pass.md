@@ -57,7 +57,7 @@ Branch `feat/ux-pass`; work-unit commits per lot; push/PR/merge remain the user'
   - F8 (resilience, stream.rs:465-470): a requested stop reports SAVED from file size alone; also require a clean exit (status success, or the exit caused by our own SIGINT), else Failed mentioning the kept file.
   - F9 (resilience, stream.rs:444): stderr drain stops at the first invalid UTF-8 line; read bytes and decode lossily so the pipe is always drained.
 
-- [ ] T7 — Fix the 3 advisory findings of native review `review-78ea4c3a7b74c68d` in one separate commit. Route: gentle-ai-worker. Commit: —
+- [x] T7 — Fix the 3 advisory findings of native review `review-78ea4c3a7b74c68d` in one separate commit. Route: gentle-ai-worker. Commit: `46790f8`. Evidence: 207 lib passed, clippy and rustfmt clean; RED per finding observed by worker.
   - G1 (risk, stream.rs:527-533 `redact_url_userinfo`): userinfo containing RFC 3986 sub-delims (`!$&'()*+,;=`), percent-encoded bytes or `:` in the password may not be fully redacted; redact everything between `scheme://` and the last `@` before the host's first `/`, `?`, `#` or whitespace.
   - G2 (reliability, app.rs:4135-4138 and other ffmpeg-dependent tests): tests return early and pass when ffmpeg is missing; make the skip explicit (`#[ignore]` with a reason, or fail unless an opt-out env var is set) so a missing ffmpeg is never reported as a pass.
   - G3 (reliability, stream.rs:221-225): when an exit is settled, the stderr tail can be read before the drain thread has stored ffmpeg's last line; join the drain thread (bounded) before reading the tail on every settle path.
