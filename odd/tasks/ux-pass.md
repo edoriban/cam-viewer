@@ -46,7 +46,7 @@ Branch `feat/ux-pass`; work-unit commits per lot; push/PR/merge remain the user'
 
 - [x] T5 — Fix 4 defects from independent gentle-ai-verify (Discover bypassed S6 lock; Drop blocked UI; stalled input ignored `q`; already-exited recorder read SAVED) + parallel exit join. Route: gentle-ai-worker. Commit: see `git log` (fix(recording): never lose a recording...). Evidence: 187 lib passed, RED per defect observed by worker; SIGINT escalation tested against a silent TCP listener (FIFO open() is not interruptible by SIGINT).
 
-- [ ] T6 — Fix the advisory findings of native review `review-c4616168871cc301` in one separate commit. Route: gentle-ai-worker. Commit: —
+- [x] T6 — Fix the advisory findings of native review `review-c4616168871cc301` in one separate commit. Route: gentle-ai-worker. Commit: `d385e8c`. Evidence: 200 lib passed, clippy and rustfmt clean; RED per finding observed by worker (F6 has no isolated test: try_wait I/O errors are not reproducible portably).
   - F1 (risk, stream.rs:457-464): ffmpeg stderr tail shown in the chip/hover may contain `rtsp://user:pass@host`; redact credentials in every recording error text before it reaches RecordingState.
   - F2 (reliability, app.rs:1591-1593): exit only joins finish threads of cameras still configured; finishes started by dropping a removed/edited camera are never awaited at exit.
   - F3 (reliability, app.rs:2343-2344): clicking a Failed chip starts a recording even when the stream has no frame; without a frame a click must dismiss the error (back to Idle), not start.
