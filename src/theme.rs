@@ -7,7 +7,9 @@ use std::sync::Arc;
 pub const SOOT: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0D);
 pub const SOOT_2: egui::Color32 = egui::Color32::from_rgb(0x17, 0x16, 0x1C);
 pub const INK: egui::Color32 = egui::Color32::from_rgb(0x14, 0x13, 0x0F);
-pub const ASH: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x6A, 0x62);
+// S8: raised from #6B6A62 (3.3:1 on SOOT_2) to clear 4.5:1 on both SOOT
+// surfaces for small text.
+pub const ASH: egui::Color32 = egui::Color32::from_rgb(0x9A, 0x9A, 0xA0);
 pub const CONCRETE: egui::Color32 = egui::Color32::from_rgb(0xB9, 0xB5, 0xAA);
 pub const PAPER: egui::Color32 = egui::Color32::from_rgb(0xEC, 0xE9, 0xE0);
 pub const PAPER_2: egui::Color32 = egui::Color32::from_rgb(0xE2, 0xDE, 0xD2);
@@ -22,8 +24,11 @@ pub const BORDER_DIM: egui::Color32 = egui::Color32::from_rgb(0x48, 0x47, 0x44);
 pub const LABEL_ON_PAPER: egui::Color32 = egui::Color32::from_rgb(0x4A, 0x49, 0x41);
 
 /// Ghost text over dark surfaces (paper white at low alpha).
+///
+/// S8: alpha raised from 90 (2.8:1 on SOOT) to 130, clearing 4.5:1 once
+/// composited over either SOOT surface.
 pub fn ghost_text() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(236, 233, 224, 90)
+    egui::Color32::from_rgba_unmultiplied(236, 233, 224, 130)
 }
 
 const DISPLAY_FAMILY: &str = "space-grotesk-bold";
@@ -433,4 +438,80 @@ pub fn elide_to_width(
         }
     }
     candidate
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    /// WCAG 2 AA minimum for small (non-bold, <18pt) text.
+    const MIN_SMALL_TEXT_CONTRAST: f64 = 4.5;
+
+    /// WCAG 2 relative luminance of an opaque sRGB color.
+    fn relative_luminance(color: egui::Color32) -> f64 {
+        let channel = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
+
+    /// WCAG 2 contrast ratio between two opaque sRGB colors.
+    fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f64 {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        let (l1, l2) = if la > lb { (la, lb) } else { (lb, la) };
+        (l1 + 0.05) / (l2 + 0.05)
+    }
+
+    /// Alpha-composites `fg` over opaque `bg`.
+    ///
+    /// `Color32` stores premultiplied components, so `fg.r()/g()/b()` are
+    /// not the straight sRGB values compositing math needs; unmultiply first.
+    fn composite_over(fg: egui::Color32, bg: egui::Color32) -> egui::Color32 {
+        let [r, g, b, a] = fg.to_srgba_unmultiplied();
+        let a = f64::from(a) / 255.0;
+        let blend =
+            |f: u8, bg_c: u8| ((f64::from(f)) * a + (f64::from(bg_c)) * (1.0 - a)).round() as u8;
+        egui::Color32::from_rgb(blend(r, bg.r()), blend(g, bg.g()), blend(b, bg.b()))
+    }
+
+    #[test]
+    fn ash_meets_minimum_contrast_on_both_soot_surfaces() {
+        assert!(
+            contrast_ratio(ASH, SOOT) >= MIN_SMALL_TEXT_CONTRAST,
+            "ASH on SOOT: {}",
+            contrast_ratio(ASH, SOOT)
+        );
+        assert!(
+            contrast_ratio(ASH, SOOT_2) >= MIN_SMALL_TEXT_CONTRAST,
+            "ASH on SOOT_2: {}",
+            contrast_ratio(ASH, SOOT_2)
+        );
+    }
+
+    #[test]
+    fn ghost_text_meets_minimum_contrast_once_composited_on_both_soot_surfaces() {
+        let on_soot = composite_over(ghost_text(), SOOT);
+        let on_soot_2 = composite_over(ghost_text(), SOOT_2);
+        assert!(
+            contrast_ratio(on_soot, SOOT) >= MIN_SMALL_TEXT_CONTRAST,
+            "ghost_text on SOOT: {}",
+            contrast_ratio(on_soot, SOOT)
+        );
+        assert!(
+            contrast_ratio(on_soot_2, SOOT_2) >= MIN_SMALL_TEXT_CONTRAST,
+            "ghost_text on SOOT_2: {}",
+            contrast_ratio(on_soot_2, SOOT_2)
+        );
+    }
+
+    #[test]
+    fn concrete_and_paper_are_unchanged() {
+        assert_eq!(CONCRETE, egui::Color32::from_rgb(0xB9, 0xB5, 0xAA));
+        assert_eq!(PAPER, egui::Color32::from_rgb(0xEC, 0xE9, 0xE0));
+    }
 }

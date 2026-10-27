@@ -10,6 +10,7 @@ use crate::theme::{self, BtnVariant};
 use crate::update;
 use eframe::egui;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(test)]
@@ -56,6 +57,10 @@ pub struct SettingsEditor {
     /// immediately; a second one confirms. Prevents a reflex Escape from
     /// silently losing an edit.
     confirm_discard: bool,
+    /// Set by the S6 "START A NEW LIST" control: unlocks editing for the
+    /// session despite a pending `config_error`, accepting the backup
+    /// `save_guarded` makes before overwriting the unreadable file.
+    started_new_list: bool,
 }
 
 impl SettingsEditor {
@@ -75,6 +80,7 @@ impl SettingsEditor {
             error: None,
             original: config.clone(),
             confirm_discard: false,
+            started_new_list: false,
         }
     }
 
@@ -122,6 +128,19 @@ enum SettingsAction {
     None,
     Cancel,
     Save,
+}
+
+/// What Settings allows while a `config_error` load failure is pending (S6).
+///
+/// The one save path (`CamViewerApp::commit_cameras`) always writes badge
+/// position, update-check and the camera list to the same file in a single
+/// `save_guarded` call — there is no way to save any of them without also
+/// overwriting the unreadable file's camera data with whatever the editor
+/// currently holds. So all three stay locked together; "START A NEW LIST"
+/// is the one way out, and it works by accepting the backup `save_guarded`
+/// already makes before overwriting.
+fn settings_locked(config_error: bool, started_new_list: bool) -> bool {
+    config_error && !started_new_list
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,6 +1135,9 @@ pub struct CamViewerApp {
     /// While this stands, `commit_cameras` refuses to overwrite the file
     /// without first backing it up (see [`config::save_guarded`]).
     config_error: Option<ConfigLoadError>,
+    /// Where `commit_cameras` saves. A field (rather than always calling
+    /// [`config::config_path`] inline) so tests can point it at a temp file.
+    config_path: PathBuf,
 }
 
 /// Which view opens at launch. A pending load error keeps the user on
@@ -1157,6 +1179,7 @@ impl CamViewerApp {
             },
             update_dismissed: false,
             config_error,
+            config_path: config::config_path(),
         }
     }
 
@@ -1321,7 +1344,7 @@ impl CamViewerApp {
         cameras: Vec<CameraConfig>,
     ) -> Result<(), String> {
         config::save_guarded(
-            &config::config_path(),
+            &self.config_path,
             &Config {
                 badge_position,
                 update_check,
@@ -1343,6 +1366,9 @@ impl CamViewerApp {
 
     fn save_settings(&mut self) {
         self.settings.error = None;
+        if settings_locked(self.config_error.is_some(), self.settings.started_new_list) {
+            return;
+        }
         let desired = self.settings.collect();
         let badge_position = self.settings.badge_position;
         let update_check = self.settings.update_check;
@@ -1525,11 +1551,13 @@ impl eframe::App for CamViewerApp {
                     DiscoverAction::None => {}
                 }
             }
-            View::Settings => match show_settings(ctx, &mut self.settings) {
-                SettingsAction::Save => self.save_settings(),
-                SettingsAction::Cancel => self.cancel_settings(),
-                SettingsAction::None => {}
-            },
+            View::Settings => {
+                match show_settings(ctx, &mut self.settings, self.config_error.is_some()) {
+                    SettingsAction::Save => self.save_settings(),
+                    SettingsAction::Cancel => self.cancel_settings(),
+                    SettingsAction::None => {}
+                }
+            }
         }
 
         ctx.request_repaint_after(REPAINT_INTERVAL);
@@ -2016,8 +2044,10 @@ fn video_surface(
             let status = cam.stream.status();
             let has_frame = cam.stream.has_frame();
             match status {
+                // S7: the centre text shows the state only, never the camera
+                // name (already shown in the tile's corner overlay / name label).
                 Status::Paused => {
-                    center_message(&painter, rect, format!("{}: paused", cam.name));
+                    center_message(&painter, rect, status.label().to_uppercase());
                 }
                 Status::Offline => {
                     offline_tile(ui, rect, cam, surface_id);
@@ -2027,7 +2057,7 @@ fn video_surface(
                         painter.text(
                             rect.center() + egui::vec2(0.0, -18.0),
                             egui::Align2::CENTER_CENTER,
-                            &cam.name,
+                            band.label(),
                             theme::mono_font(12.5),
                             theme::ghost_text(),
                         );
@@ -2726,8 +2756,13 @@ fn instrument_cell(
 // Settings view
 // ---------------------------------------------------------------------------
 
-fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAction {
+fn show_settings(
+    ctx: &egui::Context,
+    editor: &mut SettingsEditor,
+    config_error: bool,
+) -> SettingsAction {
     let mut action = SettingsAction::None;
+    let locked = settings_locked(config_error, editor.started_new_list);
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
@@ -2756,9 +2791,32 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
                 ui.add_space(4.0);
             }
 
-            badge_position_row(ui, editor);
-            ui.add_space(14.0);
-            update_check_row(ui, editor);
+            ui.add_enabled_ui(!locked, |ui| {
+                badge_position_row(ui, editor);
+                ui.add_space(14.0);
+                update_check_row(ui, editor);
+            });
+
+            if locked {
+                ui.add_space(8.0);
+                ui.label(theme::micro_label(
+                    "CAMERA LIST IS LOCKED UNTIL THE FILE LOADS.",
+                    theme::STATUS_OFFLINE,
+                ));
+                ui.label(
+                    egui::RichText::new(
+                        "Fix the file and press RELOAD, or start a new list (your file is kept as cameras.toml.bak).",
+                    )
+                    .font(theme::mono_font(11.0))
+                    .color(theme::ASH),
+                );
+                ui.add_space(8.0);
+                if theme::brutal_button(ui, "START A NEW LIST", BtnVariant::Danger) {
+                    editor.started_new_list = true;
+                }
+                ui.add_space(12.0);
+                return;
+            }
 
             let mut delete = None;
             egui::ScrollArea::vertical()
@@ -2825,7 +2883,7 @@ fn show_settings(ctx: &egui::Context, editor: &mut SettingsEditor) -> SettingsAc
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let saved = ui
                     .scope(|ui| {
-                        if !dirty {
+                        if !dirty || locked {
                             ui.disable();
                         }
                         theme::brutal_button(ui, "SAVE", BtnVariant::Confirm)
@@ -3529,6 +3587,59 @@ mod tests {
     }
 
     #[test]
+    fn settings_locked_while_a_config_error_is_pending_and_no_new_list_started() {
+        assert!(settings_locked(true, false));
+    }
+
+    #[test]
+    fn settings_unlocked_once_a_new_list_is_started_despite_the_pending_error() {
+        assert!(!settings_locked(true, true));
+    }
+
+    #[test]
+    fn settings_never_locked_without_a_pending_config_error() {
+        assert!(!settings_locked(false, false));
+        assert!(!settings_locked(false, true));
+    }
+
+    #[test]
+    fn save_settings_does_not_touch_the_file_while_the_camera_list_is_locked() {
+        let root = std::env::temp_dir().join(format!(
+            "cam-viewer-locked-save-{}-{}",
+            std::process::id(),
+            std::line!()
+        ));
+        let path = root.join(config::FILE_NAME);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create dir");
+        let original = b"this is not valid toml [[[".to_vec();
+        std::fs::write(&path, &original).expect("write malformed config");
+
+        let mut app = headless_app();
+        app.config_path = path.clone();
+        app.config_error = Some(ConfigLoadError {
+            path: path.clone(),
+            message: "parse error".to_owned(),
+        });
+        // Even a field the UI would normally block from changing must not
+        // reach the file: the guard in `save_settings` is the real backstop.
+        app.settings.update_check = !app.settings.update_check;
+        app.save_settings();
+
+        let bytes_after = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            bytes_after, original,
+            "a locked save must never touch the file on disk"
+        );
+        assert!(
+            app.settings.error.is_none(),
+            "a refused locked save is not a user-facing error"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn discovered_name_uses_vendor_guess_or_sequential_fallback() {
         let ip = Ipv4Addr::new(192, 168, 1, 64);
         assert_eq!(
@@ -3556,6 +3667,20 @@ mod tests {
         assert_eq!(tile_band(Status::Online, true), None);
         assert_eq!(tile_band(Status::Offline, false), None);
         assert_eq!(tile_band(Status::Paused, false), None);
+    }
+
+    #[test]
+    fn tile_band_label_is_the_state_only_never_a_camera_name() {
+        assert_eq!(TileBand::Reaching.label(), "CONNECTING");
+        assert_eq!(
+            TileBand::StreamOpen.label(),
+            "STREAM OPEN \u{b7} NO FRAMES YET"
+        );
+    }
+
+    #[test]
+    fn paused_centre_text_is_the_state_only_never_a_camera_name() {
+        assert_eq!(Status::Paused.label().to_uppercase(), "PAUSED");
     }
 
     #[test]
