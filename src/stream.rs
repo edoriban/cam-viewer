@@ -218,10 +218,8 @@ impl StreamHandle {
         if let Some(recorder) = slot.as_mut() {
             match recorder.child.try_wait() {
                 Ok(Some(status)) => {
-                    let tail = lock(&recorder.stderr_tail).clone();
-                    let settled =
-                        settle_exit(&recorder.path, status.success(), false, false, &tail);
-                    slot.take();
+                    let recorder = slot.take().expect("checked above");
+                    let settled = settle_already_exited(recorder, status, false, false);
                     *lock(&self.shared.recording_state) = settled;
                 }
                 Ok(None) => {}
@@ -266,9 +264,8 @@ impl StreamHandle {
         if let Some(recorder) = slot.as_mut()
             && let Ok(Some(status)) = recorder.child.try_wait()
         {
-            let tail = lock(&recorder.stderr_tail).clone();
-            let settled = settle_exit(&recorder.path, status.success(), false, false, &tail);
-            slot.take();
+            let recorder = slot.take().expect("checked above");
+            let settled = settle_already_exited(recorder, status, false, false);
             *lock(&self.shared.recording_state) = settled;
         }
 
@@ -317,8 +314,7 @@ impl StreamHandle {
         // even though STOP is being pressed now: judging it as a requested
         // stop would read a coincidental non-empty file as Saved.
         if let Ok(Some(status)) = recorder.child.try_wait() {
-            let tail = lock(&recorder.stderr_tail).clone();
-            let settled = settle_exit(&recorder.path, status.success(), false, false, &tail);
+            let settled = settle_already_exited(recorder, status, false, false);
             *lock(&self.shared.recording_state) = settled;
             return;
         }
@@ -524,12 +520,12 @@ fn redact_url_userinfo(text: &str) -> String {
             continue;
         }
         let authority_start = scheme_sep + 3;
+        // Only these four end a URI authority (G1): RFC 3986 sub-delims
+        // (`!$&'()*+,;=`), `:`, and percent-encoded bytes are all valid in
+        // userinfo and must not be mistaken for the authority's end, or the
+        // real `@` before the host is missed and the password leaks.
         let authority_end = rest[authority_start..]
-            .find(|c: char| {
-                c == '/'
-                    || c.is_whitespace()
-                    || matches!(c, '?' | '#' | '"' | '\'' | ')' | ',' | ']' | '>')
-            })
+            .find(|c: char| c == '/' || c.is_whitespace() || matches!(c, '?' | '#'))
             .map_or(rest.len(), |idx| authority_start + idx);
         out.push_str(&rest[..authority_start]);
         let authority = &rest[authority_start..authority_end];
@@ -541,6 +537,46 @@ fn redact_url_userinfo(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Bound for `join_stderr_thread`: long enough for the drain thread to
+/// flush ffmpeg's last buffered line, but never hangs a settle path if the
+/// thread somehow doesn't finish.
+const STDERR_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Joins `handle`, bounded by `timeout` (G3): a settle path that reads
+/// `stderr_tail` right after `try_wait` reports the child has exited can
+/// otherwise race the drain thread, which may still be processing ffmpeg's
+/// last line. The join itself runs on a proxy thread so a handle that
+/// doesn't finish in time is left running rather than blocking the caller
+/// past `timeout`.
+fn join_stderr_thread(handle: thread::JoinHandle<()>, timeout: Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = handle.join();
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(timeout);
+}
+
+/// Settles a recorder that `try_wait` has just found to have already
+/// exited: joins its stderr drain thread (bounded) first (G3), then judges
+/// the outcome.
+fn settle_already_exited(
+    recorder: Recorder,
+    status: std::process::ExitStatus,
+    requested: bool,
+    sigint_sent: bool,
+) -> RecordingState {
+    join_stderr_thread(recorder.stderr_thread, STDERR_JOIN_TIMEOUT);
+    let tail = lock(&recorder.stderr_tail).clone();
+    settle_exit(
+        &recorder.path,
+        status.success(),
+        requested,
+        sigint_sent,
+        &tail,
+    )
 }
 
 /// Judges what a finished ffmpeg recording child amounts to. An unrequested
@@ -651,7 +687,7 @@ fn finish_recording(mut recorder: Recorder, timeout: Duration) -> RecordingState
         let _ = recorder.child.kill();
         let _ = recorder.child.wait();
     }
-    let _ = recorder.stderr_thread.join();
+    join_stderr_thread(recorder.stderr_thread, STDERR_JOIN_TIMEOUT);
     let tail = lock(&recorder.stderr_tail).clone();
     if killed {
         let suffix = if tail.is_empty() {
@@ -1150,6 +1186,24 @@ mod ppm_tests {
         read_ppm_header(&mut Cursor::new(bytes.to_vec()))
     }
 
+    /// Checks whether `program` is on `PATH` (G2): if not, this fails the
+    /// test outright unless `CAM_VIEWER_SKIP_FFMPEG_TESTS=1` is set, in
+    /// which case it prints a skip line and returns `false` instead.
+    fn require_program(program: &str) -> bool {
+        let available = std::process::Command::new(program)
+            .arg("-version")
+            .output()
+            .is_ok();
+        if available {
+            return true;
+        }
+        if std::env::var("CAM_VIEWER_SKIP_FFMPEG_TESTS").as_deref() == Ok("1") {
+            eprintln!("skip: {program} not available (CAM_VIEWER_SKIP_FFMPEG_TESTS=1)");
+            return false;
+        }
+        panic!("{program} not available; set CAM_VIEWER_SKIP_FFMPEG_TESTS=1 to skip this test");
+    }
+
     fn test_shared() -> Shared {
         Shared {
             frame: Arc::new(Mutex::new(None)),
@@ -1286,12 +1340,7 @@ mod ppm_tests {
 
     #[test]
     fn concurrent_recording_starts_publish_at_most_one_child() {
-        let ffmpeg_available = std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .is_ok();
-        if !ffmpeg_available {
-            eprintln!("ffmpeg not available, skipping");
+        if !require_program("ffmpeg") {
             return;
         }
 
@@ -1506,9 +1555,24 @@ mod ppm_tests {
 mod tests {
     use super::{ProbeOutcome, classify_ffprobe, probe_rtsp};
     use std::net::TcpListener;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// Checks whether `program` is on `PATH` (G2): if not, this fails the
+    /// test outright unless `CAM_VIEWER_SKIP_FFMPEG_TESTS=1` is set, in
+    /// which case it prints a skip line and returns `false` instead.
+    fn require_program(program: &str) -> bool {
+        let available = Command::new(program).arg("-version").output().is_ok();
+        if available {
+            return true;
+        }
+        if std::env::var("CAM_VIEWER_SKIP_FFMPEG_TESTS").as_deref() == Ok("1") {
+            eprintln!("skip: {program} not available (CAM_VIEWER_SKIP_FFMPEG_TESTS=1)");
+            return false;
+        }
+        panic!("{program} not available; set CAM_VIEWER_SKIP_FFMPEG_TESTS=1 to skip this test");
+    }
 
     fn classify_fail(stderr: &str) -> ProbeOutcome {
         classify_ffprobe(false, "", stderr)
@@ -1631,14 +1695,7 @@ mod tests {
 
     #[test]
     fn probe_rtsp_blackhole_listener_fails_within_deadline() {
-        let ok_ffprobe = Command::new("ffprobe")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok();
-        if !ok_ffprobe {
-            eprintln!("ffprobe not available, skipping");
+        if !require_program("ffprobe") {
             return;
         }
 
@@ -1692,8 +1749,47 @@ mod recording_tests {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
+    /// Pure decision for `require_program` (G2), kept separate so it can be
+    /// tested without touching real env vars or `PATH`: a missing
+    /// ffmpeg/ffprobe must never let a test silently pass, only the
+    /// explicit opt-out may turn that into a skip.
+    fn require_program_outcome(program: &str, available: bool, skip_opt_out: bool) -> bool {
+        if available {
+            return true;
+        }
+        if skip_opt_out {
+            eprintln!("skip: {program} not available (CAM_VIEWER_SKIP_FFMPEG_TESTS=1)");
+            return false;
+        }
+        panic!("{program} not available; set CAM_VIEWER_SKIP_FFMPEG_TESTS=1 to skip this test");
+    }
+
+    /// Checks whether `program` is on `PATH`; if not, fails the test unless
+    /// `CAM_VIEWER_SKIP_FFMPEG_TESTS=1` is set.
+    fn require_program(program: &str) -> bool {
+        let available = Command::new(program).arg("-version").output().is_ok();
+        let skip_opt_out = std::env::var("CAM_VIEWER_SKIP_FFMPEG_TESTS").as_deref() == Ok("1");
+        require_program_outcome(program, available, skip_opt_out)
+    }
+
     fn ffmpeg_available() -> bool {
-        Command::new("ffmpeg").arg("-version").output().is_ok()
+        require_program("ffmpeg")
+    }
+
+    #[test]
+    #[should_panic(expected = "set CAM_VIEWER_SKIP_FFMPEG_TESTS=1")]
+    fn require_program_outcome_fails_the_test_when_missing_and_no_skip_opt_out() {
+        require_program_outcome("ffmpeg", false, false);
+    }
+
+    #[test]
+    fn require_program_outcome_skips_with_a_message_when_the_opt_out_is_set() {
+        assert!(!require_program_outcome("ffmpeg", false, true));
+    }
+
+    #[test]
+    fn require_program_outcome_passes_through_when_available() {
+        assert!(require_program_outcome("ffmpeg", true, false));
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -1894,6 +1990,33 @@ mod recording_tests {
     }
 
     #[test]
+    fn redact_url_userinfo_covers_rfc3986_sub_delims_and_colon_in_the_password() {
+        // G1: these sub-delims are all valid, unreserved userinfo
+        // characters; a premature boundary on any of them truncates the
+        // authority before the real `@`, leaking the rest of the password.
+        assert_eq!(
+            redact_url_userinfo("rtsp://admin:p!$&'()*+,;=:w@192.168.1.5/stream"),
+            "rtsp://192.168.1.5/stream"
+        );
+    }
+
+    #[test]
+    fn redact_url_userinfo_covers_percent_encoded_bytes_in_the_password() {
+        assert_eq!(
+            redact_url_userinfo("rtsp://admin:p%40ss@192.168.1.5/stream"),
+            "rtsp://192.168.1.5/stream"
+        );
+    }
+
+    #[test]
+    fn redact_url_userinfo_redacts_up_to_the_last_at_when_the_password_contains_one() {
+        assert_eq!(
+            redact_url_userinfo("rtsp://admin:pa@ss@192.168.1.5/stream"),
+            "rtsp://192.168.1.5/stream"
+        );
+    }
+
+    #[test]
     fn drain_stderr_keeps_reading_past_invalid_utf8_lines() {
         // F9: a single invalid UTF-8 line must not stop the drain — lines
         // after it still need to be read, or the pipe can fill and back
@@ -1906,11 +2029,54 @@ mod recording_tests {
     }
 
     #[test]
+    fn settle_already_exited_waits_for_the_drain_threads_final_line() {
+        // G3: a settle path that reads `stderr_tail` right after `try_wait`
+        // reports the child has exited can race the drain thread, which may
+        // still be processing ffmpeg's last line; the join must close that
+        // race, or the final line is lost.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'FINAL-LINE' 1>&2; exit 7")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn fake recorder");
+        let stderr = child.stderr.take().expect("stderr piped above");
+        let status = child.wait().expect("wait for fake recorder");
+        assert!(!status.success());
+
+        let stderr_tail = std::sync::Arc::new(Mutex::new(String::new()));
+        let tail_for_thread = std::sync::Arc::clone(&stderr_tail);
+        let stderr_thread = std::thread::Builder::new()
+            .name("fake-recorder-stderr".to_owned())
+            .spawn(move || {
+                // Starts reading only once the child has already exited and
+                // been reaped above: exactly the race the join must close.
+                std::thread::sleep(Duration::from_millis(150));
+                drain_stderr(stderr, &tail_for_thread);
+            })
+            .expect("spawn drain thread");
+        let recorder = super::Recorder {
+            child,
+            path: scratch("settle-race").join("clip.mp4"),
+            started: Instant::now(),
+            stderr_tail,
+            stderr_thread,
+        };
+
+        let state = super::settle_already_exited(recorder, status, false, false);
+        assert!(
+            matches!(&state, RecordingState::Failed(msg) if msg.contains("FINAL-LINE")),
+            "{state:?}"
+        );
+    }
+
+    #[test]
     fn recording_state_settles_an_unrequested_exit_to_failed_on_poll() {
         // F4: `recording_state()`'s own per-frame poll/settle had no direct
         // test (only `stop_recording`'s equivalent check did).
         if !ffmpeg_available() {
-            eprintln!("ffmpeg not available, skipping");
             return;
         }
         let dir = scratch("poll-settle");
@@ -1972,7 +2138,6 @@ mod recording_tests {
     #[test]
     fn finishing_a_recording_leaves_a_file_ffprobe_can_read() {
         if !ffmpeg_available() {
-            eprintln!("ffmpeg not available, skipping");
             return;
         }
         let dir = scratch("finish");
@@ -2026,7 +2191,6 @@ mod recording_tests {
         // -t clip) must not be read as a requested stop just because
         // `stop_recording` happened to be called after the fact.
         if !ffmpeg_available() {
-            eprintln!("ffmpeg not available, skipping");
             return;
         }
         let dir = scratch("already-exited");
@@ -2101,7 +2265,6 @@ mod recording_tests {
         // and never reaches the point of reading `q` from stdin. Only a
         // signal can unblock it.
         if !ffmpeg_available() {
-            eprintln!("ffmpeg not available, skipping");
             return;
         }
         let dir = scratch("stalled-finish");
@@ -2134,7 +2297,6 @@ mod recording_tests {
         // drops its `StreamHandle` on the UI thread. That must never wait
         // out a recording's stop timeout.
         if !ffmpeg_available() {
-            eprintln!("ffmpeg not available, skipping");
             return;
         }
         let dir = scratch("drop-no-block");
@@ -2171,7 +2333,6 @@ mod recording_tests {
         // Defect 5a (app exit): signal every camera first, then wait for
         // them together — not one camera's full timeout after another.
         if !ffmpeg_available() {
-            eprintln!("ffmpeg not available, skipping");
             return;
         }
         const COUNT: usize = 3;

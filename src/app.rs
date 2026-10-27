@@ -4103,11 +4103,26 @@ mod tests {
         CamViewerApp::new(&Config::default(), None)
     }
 
-    fn ffmpeg_available() -> bool {
-        std::process::Command::new("ffmpeg")
+    /// Checks whether `program` is on `PATH` (G2): if not, this fails the
+    /// test outright unless `CAM_VIEWER_SKIP_FFMPEG_TESTS=1` is set, in
+    /// which case it prints a skip line and returns `false` instead.
+    fn require_program(program: &str) -> bool {
+        let available = std::process::Command::new(program)
             .arg("-version")
             .output()
-            .is_ok()
+            .is_ok();
+        if available {
+            return true;
+        }
+        if std::env::var("CAM_VIEWER_SKIP_FFMPEG_TESTS").as_deref() == Ok("1") {
+            eprintln!("skip: {program} not available (CAM_VIEWER_SKIP_FFMPEG_TESTS=1)");
+            return false;
+        }
+        panic!("{program} not available; set CAM_VIEWER_SKIP_FFMPEG_TESTS=1 to skip this test");
+    }
+
+    fn ffmpeg_available() -> bool {
+        require_program("ffmpeg")
     }
 
     /// Binds a loopback listener that accepts one connection and then goes
@@ -4133,7 +4148,6 @@ mod tests {
         // `Drop` starts for it; the handle must be kept so exit can still
         // join it, bounded.
         if !ffmpeg_available() {
-            eprintln!("ffmpeg not available, skipping");
             return;
         }
         let addr = black_hole_listener();
