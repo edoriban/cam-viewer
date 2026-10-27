@@ -210,17 +210,28 @@ impl StreamHandle {
     }
 
     /// Polls the recording child, if any, and settles an unrequested exit
-    /// (ffmpeg dying or refusing to start) into `Failed` before returning the
-    /// current state. Called every frame by the UI.
+    /// (ffmpeg dying or refusing to start, or the child becoming unreachable,
+    /// F6) into `Failed` before returning the current state. Called every
+    /// frame by the UI.
     pub fn recording_state(&self) -> RecordingState {
         let mut slot = lock(&self.shared.recorder);
-        if let Some(recorder) = slot.as_mut()
-            && let Ok(Some(status)) = recorder.child.try_wait()
-        {
-            let tail = lock(&recorder.stderr_tail).clone();
-            let settled = settle_exit(&recorder.path, status.success(), false, &tail);
-            slot.take();
-            *lock(&self.shared.recording_state) = settled;
+        if let Some(recorder) = slot.as_mut() {
+            match recorder.child.try_wait() {
+                Ok(Some(status)) => {
+                    let tail = lock(&recorder.stderr_tail).clone();
+                    let settled =
+                        settle_exit(&recorder.path, status.success(), false, false, &tail);
+                    slot.take();
+                    *lock(&self.shared.recording_state) = settled;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    slot.take();
+                    *lock(&self.shared.recording_state) = RecordingState::Failed(
+                        redact_url_userinfo(&format!("checking recording process: {error}")),
+                    );
+                }
+            }
         }
         lock(&self.shared.recording_state).clone()
     }
@@ -229,7 +240,20 @@ impl StreamHandle {
     /// folder could not be created). Ignored while a recording is running.
     pub fn report_recording_error(&self, message: String) {
         if lock(&self.shared.recorder).is_none() {
-            *lock(&self.shared.recording_state) = RecordingState::Failed(message);
+            *lock(&self.shared.recording_state) =
+                RecordingState::Failed(redact_url_userinfo(&message));
+        }
+    }
+
+    /// Dismisses a `Failed` state back to `Idle` (F3): used when the chip
+    /// has no frame to start a new recording against, so a click on it can
+    /// only acknowledge and clear the error. A no-op unless currently
+    /// `Failed`, so a background settle racing this can never be clobbered
+    /// back to `Idle`.
+    pub fn dismiss_recording_error(&self) {
+        let mut state = lock(&self.shared.recording_state);
+        if matches!(*state, RecordingState::Failed(_)) {
+            *state = RecordingState::Idle;
         }
     }
 
@@ -243,7 +267,7 @@ impl StreamHandle {
             && let Ok(Some(status)) = recorder.child.try_wait()
         {
             let tail = lock(&recorder.stderr_tail).clone();
-            let settled = settle_exit(&recorder.path, status.success(), false, &tail);
+            let settled = settle_exit(&recorder.path, status.success(), false, false, &tail);
             slot.take();
             *lock(&self.shared.recording_state) = settled;
         }
@@ -269,7 +293,8 @@ impl StreamHandle {
         let recorder = match spawn_recorder(&args, path.clone()) {
             Ok(recorder) => recorder,
             Err(error) => {
-                *lock(&self.shared.recording_state) = RecordingState::Failed(error.clone());
+                *lock(&self.shared.recording_state) =
+                    RecordingState::Failed(redact_url_userinfo(&error));
                 return Err(error);
             }
         };
@@ -293,7 +318,7 @@ impl StreamHandle {
         // stop would read a coincidental non-empty file as Saved.
         if let Ok(Some(status)) = recorder.child.try_wait() {
             let tail = lock(&recorder.stderr_tail).clone();
-            let settled = settle_exit(&recorder.path, status.success(), false, &tail);
+            let settled = settle_exit(&recorder.path, status.success(), false, false, &tail);
             *lock(&self.shared.recording_state) = settled;
             return;
         }
@@ -326,6 +351,15 @@ impl StreamHandle {
         if let Some(handle) = lock(&self.shared.finish_thread).take() {
             let _ = handle.join();
         }
+    }
+
+    /// Takes the in-flight background finish thread's `JoinHandle`, if any,
+    /// without waiting for it (F2): used right before this handle is
+    /// dropped (a removed/edited camera), so the caller can still join that
+    /// thread, bounded, at exit instead of orphaning it the way a plain
+    /// `Drop` would.
+    pub fn take_finish_handle(&self) -> Option<thread::JoinHandle<()>> {
+        lock(&self.shared.finish_thread).take()
     }
 
     pub fn grab_start(&self, path: impl Into<String>) -> Result<(), String> {
@@ -439,36 +473,135 @@ fn spawn_recorder(args: &[String], path: PathBuf) -> Result<Recorder, String> {
     })
 }
 
-fn drain_stderr(stderr: impl Read, tail: &Mutex<String>) {
-    let reader = BufReader::new(stderr);
-    for line in reader.lines().map_while(Result::ok) {
-        if !line.trim().is_empty() {
-            *lock(tail) = line;
+fn drain_stderr(mut stderr: impl Read, tail: &Mutex<String>) {
+    // Read raw bytes and decode each line lossily instead of `BufRead::lines`
+    // (F9): that stops for good at the first invalid UTF-8 line, after which
+    // ffmpeg's stderr pipe is never drained again and can back it up.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let publish = |line: &[u8], tail: &Mutex<String>| {
+        let text = String::from_utf8_lossy(line);
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            *lock(tail) = trimmed.to_owned();
         }
+    };
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=pos).collect();
+                    publish(&line, tail);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if !buf.is_empty() {
+        publish(&buf, tail);
     }
 }
 
-/// Judges what a finished ffmpeg recording child amounts to. `success` (the
-/// process exit status) is deliberately not used to decide between Saved and
-/// Failed: an exit nobody asked for is a failure even at status 0 (e.g.
-/// ffmpeg's own `-n` "file already exists" refusal), and a requested stop is
-/// judged by whether a non-empty file actually landed on disk, since a
-/// `q`-triggered stop's exit code is not a reliable signal either way.
-fn settle_exit(path: &Path, _success: bool, requested: bool, stderr_tail: &str) -> RecordingState {
+/// Removes `user:pass@` / `user@` userinfo from every `scheme://` URL found
+/// in `text` (F1): ffmpeg's own stderr sometimes echoes the input URL back
+/// verbatim in its error messages, which can carry camera credentials, and
+/// that stderr tail ends up in recording error text shown in the UI.
+fn redact_url_userinfo(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(scheme_sep) = rest.find("://") {
+        let before_scheme = &rest[..scheme_sep];
+        let scheme_start = before_scheme
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |idx| idx + 1);
+        if scheme_start == scheme_sep {
+            // No scheme characters directly before "://": not a URL, keep
+            // scanning past it unchanged.
+            out.push_str(&rest[..scheme_sep + 3]);
+            rest = &rest[scheme_sep + 3..];
+            continue;
+        }
+        let authority_start = scheme_sep + 3;
+        let authority_end = rest[authority_start..]
+            .find(|c: char| {
+                c == '/'
+                    || c.is_whitespace()
+                    || matches!(c, '?' | '#' | '"' | '\'' | ')' | ',' | ']' | '>')
+            })
+            .map_or(rest.len(), |idx| authority_start + idx);
+        out.push_str(&rest[..authority_start]);
+        let authority = &rest[authority_start..authority_end];
+        match authority.rfind('@') {
+            Some(at) => out.push_str(&authority[at + 1..]),
+            None => out.push_str(authority),
+        }
+        rest = &rest[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Judges what a finished ffmpeg recording child amounts to. An unrequested
+/// exit is always a failure, even at `success` status 0 (e.g. ffmpeg's own
+/// `-n` "file already exists" refusal). A requested stop needs a non-empty
+/// file on disk AND a clean outcome — `success`, or `sigint_sent` (F8: ffmpeg
+/// typically exits non-zero after our own SIGINT, which must still count as
+/// clean) — else it is a failure too, since a `q`-triggered stop's exit code
+/// alone is not a reliable signal either way.
+fn settle_exit(
+    path: &Path,
+    success: bool,
+    requested: bool,
+    sigint_sent: bool,
+    stderr_tail: &str,
+) -> RecordingState {
+    let kept_file_name = || {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("the file")
+            .to_owned()
+    };
+    let has_bytes = matches!(std::fs::metadata(path), Ok(meta) if meta.len() > 0);
+
     if !requested {
-        return if stderr_tail.is_empty() {
-            RecordingState::Failed("recording stopped unexpectedly".to_owned())
+        // A partial file may still be playable (F7): name it when one landed
+        // on disk instead of only saying the recording failed.
+        let note = if has_bytes {
+            format!(" (kept {})", kept_file_name())
         } else {
-            RecordingState::Failed(stderr_tail.to_owned())
+            String::new()
+        };
+        return if stderr_tail.is_empty() {
+            RecordingState::Failed(format!("recording stopped unexpectedly{note}"))
+        } else {
+            RecordingState::Failed(format!("{}{note}", redact_url_userinfo(stderr_tail)))
         };
     }
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.len() > 0 => RecordingState::Saved {
+
+    if !has_bytes {
+        return RecordingState::Failed("nothing was recorded".to_owned());
+    }
+    // ffmpeg typically exits non-zero after our own SIGINT (F8), so that
+    // counts as clean too; anything else non-clean with a file on disk is a
+    // failure naming the kept file, since a `q`-triggered stop's exit code
+    // alone is not a reliable signal either way.
+    if success || sigint_sent {
+        return RecordingState::Saved {
             path: path.to_path_buf(),
             at: Instant::now(),
-        },
-        _ => RecordingState::Failed("nothing was recorded".to_owned()),
+        };
     }
+    let tail_note = if stderr_tail.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", redact_url_userinfo(stderr_tail))
+    };
+    RecordingState::Failed(format!(
+        "recording stopped with an error; kept {}{tail_note}",
+        kept_file_name()
+    ))
 }
 
 /// How long `finish_recording` waits for `q` alone before escalating to
@@ -492,7 +625,6 @@ fn finish_recording(mut recorder: Recorder, timeout: Duration) -> RecordingState
     let start = Instant::now();
     let deadline = start + timeout;
     let mut exit_status = None;
-    #[cfg(unix)]
     let mut sigint_sent = false;
     loop {
         match recorder.child.try_wait() {
@@ -525,14 +657,14 @@ fn finish_recording(mut recorder: Recorder, timeout: Duration) -> RecordingState
         let suffix = if tail.is_empty() {
             String::new()
         } else {
-            format!(": {tail}")
+            format!(": {}", redact_url_userinfo(&tail))
         };
         return RecordingState::Failed(format!(
             "recording did not stop in time and was force-stopped; the file may be incomplete{suffix}"
         ));
     }
     let success = exit_status.expect("checked above").success();
-    settle_exit(&recorder.path, success, true, &tail)
+    settle_exit(&recorder.path, success, true, sigint_sent, &tail)
 }
 
 /// Interrupts a child by pid via the `kill` command rather than an unsafe
@@ -1541,9 +1673,10 @@ mod tests {
 #[cfg(test)]
 mod recording_tests {
     use super::{
-        RECORDING_STOP_TIMEOUT, RecordingState, StreamHandle, finish_recording, lock,
-        recording_args, settle_exit, spawn_recorder,
+        RECORDING_STOP_TIMEOUT, RecordingState, StreamHandle, drain_stderr, finish_recording, lock,
+        recording_args, redact_url_userinfo, settle_exit, spawn_recorder,
     };
+    use std::sync::Mutex;
 
     #[test]
     fn a_recording_that_cannot_start_reports_why() {
@@ -1632,13 +1765,14 @@ mod recording_tests {
             Path::new("/nope.mp4"),
             true,
             false,
+            false,
             "File 'x' already exists. Exiting.",
         );
         assert_eq!(
             state,
             RecordingState::Failed("File 'x' already exists. Exiting.".to_owned())
         );
-        let state = settle_exit(Path::new("/nope.mp4"), false, false, "");
+        let state = settle_exit(Path::new("/nope.mp4"), false, false, false, "");
         assert_eq!(
             state,
             RecordingState::Failed("recording stopped unexpectedly".to_owned())
@@ -1647,7 +1781,7 @@ mod recording_tests {
 
     #[test]
     fn a_requested_stop_with_no_file_reports_that_nothing_was_recorded() {
-        let state = settle_exit(Path::new("/definitely/missing.mp4"), true, true, "");
+        let state = settle_exit(Path::new("/definitely/missing.mp4"), true, true, false, "");
         assert_eq!(
             state,
             RecordingState::Failed("nothing was recorded".to_owned())
@@ -1660,9 +1794,178 @@ mod recording_tests {
         let path = dir.join("ok.mp4");
         std::fs::write(&path, b"data").expect("file");
         assert!(matches!(
-            settle_exit(&path, true, true, ""),
+            settle_exit(&path, true, true, false, ""),
             RecordingState::Saved { path: saved, .. } if saved == path
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unrequested_exit_with_a_nonempty_file_names_it_in_the_failure() {
+        // F7: an unrequested exit may still leave a partial, possibly
+        // playable file; the failure must name it instead of hiding it.
+        let dir = scratch("unrequested-partial");
+        let path = dir.join("partial.mp4");
+        std::fs::write(&path, b"some bytes").expect("file");
+        let state = settle_exit(&path, false, false, false, "");
+        assert!(
+            matches!(&state, RecordingState::Failed(msg) if msg.contains("partial.mp4")),
+            "{state:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_requested_stop_with_an_unclean_exit_and_no_sigint_is_failed_naming_the_file() {
+        // F8: a non-empty file alone is not enough for a requested stop to
+        // read as Saved — the exit must also be clean (success, or our own
+        // SIGINT).
+        let dir = scratch("unclean-stop");
+        let path = dir.join("clip.mp4");
+        std::fs::write(&path, b"data").expect("file");
+        let state = settle_exit(&path, false, true, false, "");
+        assert!(
+            matches!(&state, RecordingState::Failed(msg) if msg.contains("clip.mp4")),
+            "{state:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_requested_stop_after_our_own_sigint_with_a_nonzero_exit_is_still_saved() {
+        // F8: ffmpeg typically exits non-zero after our own SIGINT, which
+        // must still count as a clean stop.
+        let dir = scratch("sigint-clean");
+        let path = dir.join("clip.mp4");
+        std::fs::write(&path, b"data").expect("file");
+        let state = settle_exit(&path, false, true, true, "");
+        assert!(matches!(state, RecordingState::Saved { .. }), "{state:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unrequested_exit_redacts_credentials_from_the_stderr_tail() {
+        // F1: ffmpeg's stderr can echo the input URL (and its credentials)
+        // back in its own error text.
+        let state = settle_exit(
+            Path::new("/nope.mp4"),
+            false,
+            false,
+            false,
+            "Connection to rtsp://admin:secret@192.168.1.5 failed",
+        );
+        assert!(
+            matches!(&state, RecordingState::Failed(msg)
+                if !msg.contains("secret") && msg.contains("192.168.1.5")),
+            "{state:?}"
+        );
+    }
+
+    #[test]
+    fn redact_url_userinfo_removes_user_and_password() {
+        assert_eq!(
+            redact_url_userinfo("ffmpeg: rtsp://admin:secret@192.168.1.5/stream timed out"),
+            "ffmpeg: rtsp://192.168.1.5/stream timed out"
+        );
+    }
+
+    #[test]
+    fn redact_url_userinfo_removes_user_only() {
+        assert_eq!(
+            redact_url_userinfo("rtsp://admin@192.168.1.5/stream"),
+            "rtsp://192.168.1.5/stream"
+        );
+    }
+
+    #[test]
+    fn redact_url_userinfo_leaves_text_without_a_url_untouched() {
+        assert_eq!(
+            redact_url_userinfo("nothing was recorded"),
+            "nothing was recorded"
+        );
+    }
+
+    #[test]
+    fn redact_url_userinfo_redacts_every_url_in_the_text() {
+        assert_eq!(
+            redact_url_userinfo("rtsp://u:p@h1/x and rtsp://u2@h2/y"),
+            "rtsp://h1/x and rtsp://h2/y"
+        );
+    }
+
+    #[test]
+    fn drain_stderr_keeps_reading_past_invalid_utf8_lines() {
+        // F9: a single invalid UTF-8 line must not stop the drain — lines
+        // after it still need to be read, or the pipe can fill and back
+        // ffmpeg up.
+        let bytes = b"\xFF\xFE garbage\nhello world\n".to_vec();
+        let cursor = std::io::Cursor::new(bytes);
+        let tail = Mutex::new(String::new());
+        drain_stderr(cursor, &tail);
+        assert_eq!(*lock(&tail), "hello world");
+    }
+
+    #[test]
+    fn recording_state_settles_an_unrequested_exit_to_failed_on_poll() {
+        // F4: `recording_state()`'s own per-frame poll/settle had no direct
+        // test (only `stop_recording`'s equivalent check did).
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not available, skipping");
+            return;
+        }
+        let dir = scratch("poll-settle");
+        let path = dir.join("clip.mp4");
+        let args: Vec<String> = [
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=160x120:rate=15",
+            "-t",
+            "0.3",
+            "-c:v",
+            "libx264",
+            "-f",
+            "mp4",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain([path.display().to_string()])
+        .collect();
+        let recorder = spawn_recorder(&args, path.clone()).expect("spawn ffmpeg");
+
+        let handle = StreamHandle::spawn("rtsp://127.0.0.1:1/none", true);
+        {
+            let mut slot = lock(&handle.shared.recorder);
+            *slot = Some(recorder);
+            let rec = slot.as_mut().expect("just inserted");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let exited = loop {
+                if matches!(rec.child.try_wait(), Ok(Some(_))) {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            assert!(
+                exited,
+                "the bounded clip must finish on its own well within 5s"
+            );
+        }
+        *lock(&handle.shared.recording_state) = RecordingState::Recording {
+            path: path.clone(),
+            started: Instant::now(),
+        };
+
+        let state = handle.recording_state();
+        assert!(
+            matches!(state, RecordingState::Failed(_)),
+            "an ffmpeg that exits on its own must settle to Failed on the very next poll: {state:?}"
+        );
+        handle.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

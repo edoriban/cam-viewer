@@ -46,6 +46,18 @@ Branch `feat/ux-pass`; work-unit commits per lot; push/PR/merge remain the user'
 
 - [x] T5 — Fix 4 defects from independent gentle-ai-verify (Discover bypassed S6 lock; Drop blocked UI; stalled input ignored `q`; already-exited recorder read SAVED) + parallel exit join. Route: gentle-ai-worker. Commit: see `git log` (fix(recording): never lose a recording...). Evidence: 187 lib passed, RED per defect observed by worker; SIGINT escalation tested against a silent TCP listener (FIFO open() is not interruptible by SIGINT).
 
+- [ ] T6 — Fix the advisory findings of native review `review-c4616168871cc301` in one separate commit. Route: gentle-ai-worker. Commit: —
+  - F1 (risk, stream.rs:457-464): ffmpeg stderr tail shown in the chip/hover may contain `rtsp://user:pass@host`; redact credentials in every recording error text before it reaches RecordingState.
+  - F2 (reliability, app.rs:1591-1593): exit only joins finish threads of cameras still configured; finishes started by dropping a removed/edited camera are never awaited at exit.
+  - F3 (reliability, app.rs:2343-2344): clicking a Failed chip starts a recording even when the stream has no frame; without a frame a click must dismiss the error (back to Idle), not start.
+  - F4 (reliability, stream.rs:216-223): per-frame settle of an unrequested exit in `recording_state()` has no test.
+  - F5 (reliability, app.rs:3209-3211): the S11 welcome-margin test duplicates the layout instead of measuring the real welcome view.
+  - F6 (reliability, stream.rs:217-218): a `try_wait` error is ignored; it must settle as Failed.
+  - F7 (reliability+resilience, stream.rs:458-464): an unrequested exit reports Failed but hides that a partial, possibly playable file exists; mention it (file name) when non-empty.
+  - F8 (resilience, stream.rs:465-470): a requested stop reports SAVED from file size alone; also require a clean exit (status success, or the exit caused by our own SIGINT), else Failed mentioning the kept file.
+  - F9 (resilience, stream.rs:444): stderr drain stops at the first invalid UTF-8 line; read bytes and decode lossily so the pipe is always drained.
+
 ## Log
 - L1: "pasale ux pass y taste a la aplicación a ver qué se mejora" → "haz un artifact para poder ver tu propuesta de una manera mas visual" → decisions A, B, C; bug 01 = mp4-graceful; "vamos con esto".
 - L2: independent verify (S1 partial, S2 partial, S5 pass, S6 fail) → defects fixed in T5.
+- L3: native review approved with 10 advisory findings; user: "corrige los problemas enun commit aparte".

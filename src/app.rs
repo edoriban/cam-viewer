@@ -12,6 +12,7 @@ use eframe::egui;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
@@ -1145,6 +1146,12 @@ pub struct CamViewerApp {
     /// Where `commit_cameras` saves. A field (rather than always calling
     /// [`config::config_path`] inline) so tests can point it at a temp file.
     config_path: PathBuf,
+    /// Background recorder-finish threads started by `apply_cameras`
+    /// dropping/replacing a `StreamHandle` (F2): its own `Drop` spawns one
+    /// of these for an active recording but has no way to wait for it, so
+    /// `apply_cameras` takes the `JoinHandle` here instead of letting it be
+    /// orphaned; `on_exit` joins them alongside every current camera's.
+    pending_exit_finishes: Vec<thread::JoinHandle<()>>,
 }
 
 /// Which view opens at launch. A pending load error keeps the user on
@@ -1187,6 +1194,7 @@ impl CamViewerApp {
             update_dismissed: false,
             config_error,
             config_path: config::config_path(),
+            pending_exit_finishes: Vec::new(),
         }
     }
 
@@ -1475,7 +1483,17 @@ impl CamViewerApp {
             });
         }
 
-        drop(pool.into_iter().flatten());
+        // A removed/edited camera's StreamHandle is about to be dropped
+        // here; `Drop` may itself spawn a background finish thread for an
+        // active recording but has no way to wait for it. Take that
+        // thread's `JoinHandle` first so `on_exit` can still join it,
+        // bounded, instead of it being orphaned (F2).
+        for view in pool.into_iter().flatten() {
+            view.stream.stop();
+            if let Some(handle) = view.stream.take_finish_handle() {
+                self.pending_exit_finishes.push(handle);
+            }
+        }
         self.cameras = cameras;
     }
 }
@@ -1590,6 +1608,9 @@ impl eframe::App for CamViewerApp {
         }
         for cam in &self.cameras {
             cam.stream.join_finish();
+        }
+        for handle in self.pending_exit_finishes.drain(..) {
+            let _ = handle.join();
         }
     }
 }
@@ -1809,7 +1830,8 @@ fn show_grid(
                     ui.add_space(offset);
                 }
                 let top = ui.cursor().top();
-                empty_state_action = welcome_view(ui);
+                let (action, _, _) = welcome_view(ui);
+                empty_state_action = action;
                 let content_height = ui.cursor().top() - top;
                 ui.memory_mut(|mem| mem.data.insert_temp(height_id, content_height));
                 return;
@@ -1852,7 +1874,10 @@ fn show_grid(
 /// opens for an empty config (absent a pending load error), so this is the
 /// one call site that ever needs to show it — the previous "route to
 /// Settings when the config is empty" landing is what's actually replaced.
-fn welcome_view(ui: &mut egui::Ui) -> GridAction {
+/// Returns the action (if any) and each card's own rendered rect (F5:
+/// callers, including the S11 margin test, measure the real layout instead
+/// of a duplicated one).
+fn welcome_view(ui: &mut egui::Ui) -> (GridAction, egui::Rect, egui::Rect) {
     let mut action = GridAction::None;
     ui.label(theme::micro_label("WELCOME", theme::ASH));
     ui.add_space(4.0);
@@ -1872,33 +1897,32 @@ fn welcome_view(ui: &mut egui::Ui) -> GridAction {
     ui.add_space(18.0);
 
     let available = ui.available_width();
-    if welcome_options_stack(available) {
+    let (first_rect, second_rect) = if welcome_options_stack(available) {
         let width = available.max(WELCOME_OPTION_MIN_WIDTH);
-        if welcome_option(
+        let (clicked1, rect1) = welcome_option(
             ui,
             width,
             "Scan this network",
             "Finds ONVIF and RTSP cameras on your network interfaces.",
             "DISCOVER",
             BtnVariant::Confirm,
-        )
-        .0
-        {
+        );
+        if clicked1 {
             action = GridAction::GoToDiscover;
         }
         ui.add_space(10.0);
-        if welcome_option(
+        let (clicked2, rect2) = welcome_option(
             ui,
             width,
             "I have a URL",
             "Paste an rtsp:// address, e.g. rtsp://192.168.1.20/stream1",
             "+ ADD CAMERA",
             BtnVariant::Paper,
-        )
-        .0
-        {
+        );
+        if clicked2 {
             action = GridAction::GoToSettings;
         }
+        (rect1, rect2)
     } else {
         let width = ((available - WELCOME_OPTION_GAP) / 2.0).max(WELCOME_OPTION_MIN_WIDTH);
         // Matches the grid's own GRID_SPACING pattern: without this, egui's
@@ -1906,35 +1930,37 @@ fn welcome_view(ui: &mut egui::Ui) -> GridAction {
         // WELCOME_OPTION_GAP below, pushing the right card's edge past the
         // grid's 18px margin (S11).
         ui.spacing_mut().item_spacing.x = 0.0;
-        ui.horizontal(|ui| {
-            if welcome_option(
-                ui,
-                width,
-                "Scan this network",
-                "Finds ONVIF and RTSP cameras on your network interfaces.",
-                "DISCOVER",
-                BtnVariant::Confirm,
-            )
-            .0
-            {
-                action = GridAction::GoToDiscover;
-            }
-            ui.add_space(WELCOME_OPTION_GAP);
-            if welcome_option(
-                ui,
-                width,
-                "I have a URL",
-                "Paste an rtsp:// address, e.g. rtsp://192.168.1.20/stream1",
-                "+ ADD CAMERA",
-                BtnVariant::Paper,
-            )
-            .0
-            {
-                action = GridAction::GoToSettings;
-            }
-        });
-    }
-    action
+        let (clicked1, clicked2, rect1, rect2) = ui
+            .horizontal(|ui| {
+                let (clicked1, rect1) = welcome_option(
+                    ui,
+                    width,
+                    "Scan this network",
+                    "Finds ONVIF and RTSP cameras on your network interfaces.",
+                    "DISCOVER",
+                    BtnVariant::Confirm,
+                );
+                ui.add_space(WELCOME_OPTION_GAP);
+                let (clicked2, rect2) = welcome_option(
+                    ui,
+                    width,
+                    "I have a URL",
+                    "Paste an rtsp:// address, e.g. rtsp://192.168.1.20/stream1",
+                    "+ ADD CAMERA",
+                    BtnVariant::Paper,
+                );
+                (clicked1, clicked2, rect1, rect2)
+            })
+            .inner;
+        if clicked1 {
+            action = GridAction::GoToDiscover;
+        }
+        if clicked2 {
+            action = GridAction::GoToSettings;
+        }
+        (rect1, rect2)
+    };
+    (action, first_rect, second_rect)
 }
 
 /// Vertical offset (S12) to center the welcome block within
@@ -2401,33 +2427,64 @@ fn recording_chip_text(painter: &egui::Painter, state: &crate::stream::Recording
     }
 }
 
+/// What a click on the recording chip should do (F3): a Failed chip with no
+/// frame to record against must only dismiss the error back to Idle (so it
+/// stays readable until then, see `record_control_visible`), not reinterpret
+/// the click as starting a new recording against a stream that has nothing
+/// to feed ffmpeg; with a frame, Failed behaves like Idle as before.
+#[derive(Debug, PartialEq, Eq)]
+enum RecordingChipClick {
+    Stop,
+    OpenFolder,
+    None,
+    StartRecording,
+    Dismiss,
+}
+
+fn recording_chip_click_action(
+    has_frame: bool,
+    state: &crate::stream::RecordingState,
+) -> RecordingChipClick {
+    use crate::stream::RecordingState;
+    match state {
+        RecordingState::Recording { .. } => RecordingChipClick::Stop,
+        RecordingState::Saved { .. } => RecordingChipClick::OpenFolder,
+        RecordingState::Saving { .. } => RecordingChipClick::None,
+        RecordingState::Idle => RecordingChipClick::StartRecording,
+        RecordingState::Failed(_) if has_frame => RecordingChipClick::StartRecording,
+        RecordingState::Failed(_) => RecordingChipClick::Dismiss,
+    }
+}
+
 fn draw_recording_chip(
     ui: &mut egui::Ui,
     cam: &CameraView,
     painter: &egui::Painter,
     rect: egui::Rect,
     state: &crate::stream::RecordingState,
+    has_frame: bool,
     surface_id: egui::Id,
 ) {
     use crate::stream::RecordingState;
     let response = ui.interact(rect, surface_id.with("recording"), egui::Sense::click());
     if response.clicked() {
-        match state {
-            RecordingState::Recording { .. } => cam.stream.stop_recording(),
-            RecordingState::Saved { path, .. } => {
-                if let Some(parent) = path.parent() {
+        match recording_chip_click_action(has_frame, state) {
+            RecordingChipClick::Stop => cam.stream.stop_recording(),
+            RecordingChipClick::OpenFolder => {
+                if let RecordingState::Saved { path, .. } = state
+                    && let Some(parent) = path.parent()
+                {
                     open_in_os_default_app(parent);
                 }
             }
-            RecordingState::Saving { .. } => {}
-            RecordingState::Idle | RecordingState::Failed(_) => {
-                match crate::recordings::prepare(&cam.name) {
-                    Ok(path) => {
-                        let _ = cam.stream.start_recording(path.display().to_string());
-                    }
-                    Err(error) => cam.stream.report_recording_error(error),
+            RecordingChipClick::None => {}
+            RecordingChipClick::StartRecording => match crate::recordings::prepare(&cam.name) {
+                Ok(path) => {
+                    let _ = cam.stream.start_recording(path.display().to_string());
                 }
-            }
+                Err(error) => cam.stream.report_recording_error(error),
+            },
+            RecordingChipClick::Dismiss => cam.stream.dismiss_recording_error(),
         }
     }
 
@@ -2526,7 +2583,15 @@ fn tile_controls(
         theme::draw_chip(&painter, mute_rect, mute_text, fg, theme::SOOT_2);
     }
     if let Some(record_rect) = record_rect {
-        draw_recording_chip(ui, cam, &painter, record_rect, &state, surface_id);
+        draw_recording_chip(
+            ui,
+            cam,
+            &painter,
+            record_rect,
+            &state,
+            has_frame,
+            surface_id,
+        );
     }
 
     Some(
@@ -3187,10 +3252,9 @@ mod tests {
         targets
     }
 
-    /// Renders the two side-by-side welcome cards exactly as `welcome_view`
-    /// lays them out, at a fixed available width, and returns each card's
-    /// own rendered rect (not a heuristic guess at it).
-    fn side_by_side_welcome_card_rects(available_width: f32) -> (egui::Rect, egui::Rect) {
+    /// Renders the real `welcome_view` (F5: not a duplicated layout) at a
+    /// fixed available width and returns each card's own rendered rect.
+    fn welcome_view_card_rects(available_width: f32) -> (egui::Rect, egui::Rect) {
         let ctx = egui::Context::default();
         crate::theme::install(&ctx);
         let input = || egui::RawInput {
@@ -3206,32 +3270,11 @@ mod tests {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new())
                 .show(ctx, |ui| {
-                    let width = ((available_width - WELCOME_OPTION_GAP) / 2.0)
-                        .max(WELCOME_OPTION_MIN_WIDTH);
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.horizontal(|ui| {
-                        let (_, rect1) = welcome_option(
-                            ui,
-                            width,
-                            "Scan this network",
-                            "Finds ONVIF and RTSP cameras on your network interfaces.",
-                            "DISCOVER",
-                            BtnVariant::Confirm,
-                        );
-                        ui.add_space(WELCOME_OPTION_GAP);
-                        let (_, rect2) = welcome_option(
-                            ui,
-                            width,
-                            "I have a URL",
-                            "Paste an rtsp:// address, e.g. rtsp://192.168.1.20/stream1",
-                            "+ ADD CAMERA",
-                            BtnVariant::Paper,
-                        );
-                        rects = Some((rect1, rect2));
-                    });
+                    let (_, rect1, rect2) = welcome_view(ui);
+                    rects = Some((rect1, rect2));
                 });
         });
-        rects.expect("both welcome cards rendered")
+        rects.expect("welcome view renders both cards")
     }
 
     #[test]
@@ -3240,7 +3283,7 @@ mod tests {
         // side (`show_grid`'s `inner_margin(Margin::same(18))`), so a card
         // reaching exactly `available_width` lands on that same margin.
         let available_width = 1172.0_f32;
-        let (first, second) = side_by_side_welcome_card_rects(available_width);
+        let (first, second) = welcome_view_card_rects(available_width);
         assert!(
             first.right() < second.left(),
             "cards must not overlap: {first:?} vs {second:?}"
@@ -4060,6 +4103,72 @@ mod tests {
         CamViewerApp::new(&Config::default(), None)
     }
 
+    fn ffmpeg_available() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok()
+    }
+
+    /// Binds a loopback listener that accepts one connection and then goes
+    /// silent, mirroring `stream.rs`'s own fixture of the same name: a
+    /// stand-in for a camera whose connection stalls mid-handshake, so the
+    /// recorder it backs stays alive long enough for `apply_cameras` to drop
+    /// it while still recording.
+    fn black_hole_listener() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn dropping_a_camera_with_an_active_recording_keeps_its_finish_handle_for_exit() {
+        // F2: `apply_cameras` dropping a removed/edited camera's
+        // `StreamHandle` must not orphan a recorder-finish thread that
+        // `Drop` starts for it; the handle must be kept so exit can still
+        // join it, bounded.
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not available, skipping");
+            return;
+        }
+        let addr = black_hole_listener();
+        let url = format!("rtsp://{addr}/x");
+        let stream = StreamHandle::spawn(url.clone(), true);
+        let dir = std::env::temp_dir().join(format!("cam-viewer-app-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("clip.mp4");
+        stream
+            .start_recording(path.display().to_string())
+            .expect("start recording");
+
+        let mut app = headless_app();
+        app.cameras.push(CameraView {
+            name: "Stalled".to_owned(),
+            url,
+            stream,
+            texture: None,
+        });
+
+        app.apply_cameras(Vec::new());
+
+        assert_eq!(
+            app.pending_exit_finishes.len(),
+            1,
+            "the dropped camera's background finish thread must be kept, not orphaned"
+        );
+        let handle = app.pending_exit_finishes.pop().expect("just asserted");
+        handle
+            .join()
+            .expect("finish thread must complete within its own bound");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn end_detached_releases_a_live_pipeline_without_blocking_the_caller() {
         let mut wizard = live_scan_wizard();
@@ -4254,6 +4363,27 @@ mod tests {
             false,
             &RecordingState::Failed("boom".to_owned())
         ));
+    }
+
+    #[test]
+    fn failed_chip_with_no_frame_only_dismisses() {
+        // F3: without a frame there is nothing to feed a new recording, so
+        // the click must clear the error (back to Idle) instead of starting
+        // one.
+        use crate::stream::RecordingState;
+        assert_eq!(
+            recording_chip_click_action(false, &RecordingState::Failed("boom".to_owned())),
+            RecordingChipClick::Dismiss
+        );
+    }
+
+    #[test]
+    fn failed_chip_with_a_frame_starts_a_new_recording_as_before() {
+        use crate::stream::RecordingState;
+        assert_eq!(
+            recording_chip_click_action(true, &RecordingState::Failed("boom".to_owned())),
+            RecordingChipClick::StartRecording
+        );
     }
 
     #[test]
