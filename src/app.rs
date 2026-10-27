@@ -610,7 +610,7 @@ impl DiscoverWizard {
         self.error = None;
     }
 
-    fn show(&mut self, ctx: &egui::Context) -> DiscoverAction {
+    fn show(&mut self, ctx: &egui::Context, locked: bool) -> DiscoverAction {
         let mut action = DiscoverAction::None;
         egui::CentralPanel::default()
             .frame(
@@ -644,7 +644,7 @@ impl DiscoverWizard {
                 } else if self.rows.is_empty() {
                     self.show_idle(ui, &mut action);
                 } else {
-                    self.show_results(ui, &mut action);
+                    self.show_results(ui, &mut action, locked);
                 }
             });
         action
@@ -763,7 +763,7 @@ impl DiscoverWizard {
         });
     }
 
-    fn show_results(&mut self, ui: &mut egui::Ui, action: &mut DiscoverAction) {
+    fn show_results(&mut self, ui: &mut egui::Ui, action: &mut DiscoverAction, locked: bool) {
         ui.add_space(4.0);
         let selected = self
             .rows
@@ -780,6 +780,12 @@ impl DiscoverWizard {
         ));
         auth_legend(ui);
         self.maybe_ws_hint(ui);
+        if locked {
+            ui.label(theme::micro_label(
+                "CAMERA LIST IS LOCKED UNTIL THE FILE LOADS.",
+                theme::STATUS_OFFLINE,
+            ));
+        }
         ui.add_space(6.0);
 
         egui::ScrollArea::vertical()
@@ -791,8 +797,9 @@ impl DiscoverWizard {
 
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Disabled (unclickable) when nothing addable is ticked (REQ-13).
-            let can_add = selected > 0;
+            // Disabled (unclickable) when nothing addable is ticked (REQ-13)
+            // or while the camera list is locked (S6).
+            let can_add = selected > 0 && !locked;
             let clicked = ui
                 .scope(|ui| {
                     if !can_add {
@@ -1343,6 +1350,12 @@ impl CamViewerApp {
         update_check: bool,
         cameras: Vec<CameraConfig>,
     ) -> Result<(), String> {
+        // The one guard for every save path (S6): callers that do not
+        // pre-check (Discover's `add_selected`) must not be able to write
+        // over an unreadable file just because they forgot to ask.
+        if settings_locked(self.config_error.is_some(), self.settings.started_new_list) {
+            return Err("Camera list is locked until the file loads.".to_owned());
+        }
         config::save_guarded(
             &self.config_path,
             &Config {
@@ -1526,10 +1539,12 @@ impl eframe::App for CamViewerApp {
                 }
             }
             View::Discover => {
+                let locked =
+                    settings_locked(self.config_error.is_some(), self.settings.started_new_list);
                 let action = self
                     .discover
                     .as_mut()
-                    .map(|wizard| wizard.show(ctx))
+                    .map(|wizard| wizard.show(ctx, locked))
                     .unwrap_or(DiscoverAction::None);
                 match action {
                     DiscoverAction::Scan => {
@@ -1564,8 +1579,17 @@ impl eframe::App for CamViewerApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Signal every camera first, then wait for them together: waiting
+        // one camera's full stop timeout at a time before even signalling
+        // the next would make shutdown cost roughly N times a single
+        // camera's bound instead of one. `join_finish` also picks up any
+        // background finish thread still in flight from an earlier
+        // interactive STOP, so that ffmpeg is never orphaned either.
         for cam in &self.cameras {
             cam.stream.stop();
+        }
+        for cam in &self.cameras {
+            cam.stream.join_finish();
         }
     }
 }
@@ -3729,6 +3753,48 @@ mod tests {
         assert!(
             app.settings.error.is_none(),
             "a refused locked save is not a user-facing error"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn add_selected_does_not_touch_the_file_while_the_camera_list_is_locked() {
+        // Defect 1 (S6): `commit_cameras` must refuse while locked for
+        // every caller, not just `save_settings`'s own pre-check.
+        let root = std::env::temp_dir().join(format!(
+            "cam-viewer-locked-add-selected-{}-{}",
+            std::process::id(),
+            std::line!()
+        ));
+        let path = root.join(config::FILE_NAME);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create dir");
+        let original = b"this is not valid toml [[[".to_vec();
+        std::fs::write(&path, &original).expect("write malformed config");
+
+        let mut app = headless_app();
+        app.config_path = path.clone();
+        app.config_error = Some(ConfigLoadError {
+            path: path.clone(),
+            message: "parse error".to_owned(),
+        });
+        let mut row = DiscoverRow::new(result(
+            [192, 168, 1, 64],
+            Some("rtsp://192.168.1.64:554/x"),
+            RowStatus::Open,
+        ));
+        row.checked = true;
+        let mut wizard = DiscoverWizard::new();
+        wizard.rows.push(row);
+        app.discover = Some(wizard);
+
+        app.add_selected();
+
+        let bytes_after = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            bytes_after, original,
+            "add_selected must never touch the file while the camera list is locked"
         );
 
         let _ = std::fs::remove_dir_all(&root);

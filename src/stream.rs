@@ -51,12 +51,15 @@ pub enum RecordingState {
     Failed(String),
 }
 
-/// Bound on how long `stop()` (app shutdown / `Drop`) waits for ffmpeg to
-/// finish writing the file after asking it to quit, before giving up and
-/// killing it.
+/// Bound on how long the background finish thread `stop()` (app shutdown /
+/// `Drop`) starts waits for ffmpeg to finish writing the file after asking
+/// it to quit, before giving up and killing it. Kept short relative to
+/// `RECORDING_FINISH_TIMEOUT` because `CamViewerApp::on_exit` waits
+/// (bounded, via `join_finish`) for every camera's thread together before
+/// the app actually quits.
 const RECORDING_STOP_TIMEOUT: Duration = Duration::from_secs(3);
-/// Same bound for an interactive STOP click, backgrounded so the UI stays
-/// responsive while ffmpeg finalizes the file.
+/// Same bound for an interactive STOP click's background finish thread,
+/// longer since nothing is waiting on it synchronously.
 const RECORDING_FINISH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// A running recorder: the ffmpeg child plus the plumbing `finish_recording`
@@ -98,6 +101,12 @@ struct Shared {
     /// Set by `StreamHandle::retry_now` to wake an in-progress backoff sleep
     /// immediately; consumed (cleared) by `sleep_interruptible` itself.
     retry_wake: Arc<AtomicBool>,
+    /// Handle for an in-flight background recorder-finish thread, started by
+    /// `stop_recording` or by `StreamHandle::stop` signalling shutdown while
+    /// a recording was active. `StreamHandle::join_finish` takes and joins
+    /// it, bounded by the thread's own `finish_recording` timeout, so app
+    /// exit never orphans an ffmpeg process still finalizing a file.
+    finish_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 pub struct StreamHandle {
@@ -123,6 +132,7 @@ impl StreamHandle {
             phase_started: Arc::new(Mutex::new(Instant::now())),
             has_frame: Arc::new(AtomicBool::new(false)),
             retry_wake: Arc::new(AtomicBool::new(false)),
+            finish_thread: Arc::new(Mutex::new(None)),
         };
         let thread_shared = shared.clone();
         thread::Builder::new()
@@ -172,9 +182,17 @@ impl StreamHandle {
         self.shared.retry_wake.store(true, Ordering::Relaxed);
     }
 
+    /// Signals this stream (and any active recorder) to stop, without
+    /// blocking the caller: used by `Drop` (removing or editing a camera via
+    /// `apply_cameras` runs this on the UI thread) and by app exit's first
+    /// pass over every camera (see `CamViewerApp::on_exit`), which then
+    /// calls `join_finish` on all of them together instead of waiting here
+    /// one camera at a time.
     pub fn stop(&self) {
         self.shared.shutdown.store(true, Ordering::Relaxed);
-        self.finish_recording_sync(RECORDING_STOP_TIMEOUT);
+        if let Some(recorder) = lock(&self.shared.recorder).take() {
+            self.spawn_finish(recorder, RECORDING_STOP_TIMEOUT);
+        }
         stop_child(&self.shared.child);
         stop_child(&self.shared.audio_child);
     }
@@ -265,34 +283,49 @@ impl StreamHandle {
     /// immediately, and finishes ffmpeg on a background thread so the UI
     /// stays responsive while the file is finalized.
     pub fn stop_recording(&self) {
-        let Some(recorder) = lock(&self.shared.recorder).take() else {
-            return;
+        let mut recorder = match lock(&self.shared.recorder).take() {
+            Some(recorder) => recorder,
+            None => return,
         };
+        // An ffmpeg that already exited on its own (e.g. refused to start,
+        // or a bounded clip that finished by itself) is an unrequested exit
+        // even though STOP is being pressed now: judging it as a requested
+        // stop would read a coincidental non-empty file as Saved.
+        if let Ok(Some(status)) = recorder.child.try_wait() {
+            let tail = lock(&recorder.stderr_tail).clone();
+            let settled = settle_exit(&recorder.path, status.success(), false, &tail);
+            *lock(&self.shared.recording_state) = settled;
+            return;
+        }
+        self.spawn_finish(recorder, RECORDING_FINISH_TIMEOUT);
+    }
+
+    /// Publishes `Saving` and finishes `recorder` on a background thread
+    /// (never the caller's), keeping its `JoinHandle` in `Shared` so
+    /// `join_finish` can wait for it later without blocking here.
+    fn spawn_finish(&self, recorder: Recorder, timeout: Duration) {
         *lock(&self.shared.recording_state) = RecordingState::Saving {
             path: recorder.path.clone(),
         };
         let state_slot = Arc::clone(&self.shared.recording_state);
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("cam-recorder-finish".to_owned())
             .spawn(move || {
-                let settled = finish_recording(recorder, RECORDING_FINISH_TIMEOUT);
+                let settled = finish_recording(recorder, timeout);
                 *lock(&state_slot) = settled;
             })
             .expect("failed to spawn recorder-finish thread");
+        *lock(&self.shared.finish_thread) = Some(handle);
     }
 
-    /// Same as `stop_recording`, but finishes synchronously: used by `stop()`
-    /// (app shutdown / `Drop`), where the process may exit right after and a
-    /// backgrounded finish would never get to run.
-    fn finish_recording_sync(&self, timeout: Duration) {
-        let Some(recorder) = lock(&self.shared.recorder).take() else {
-            return;
-        };
-        *lock(&self.shared.recording_state) = RecordingState::Saving {
-            path: recorder.path.clone(),
-        };
-        let settled = finish_recording(recorder, timeout);
-        *lock(&self.shared.recording_state) = settled;
+    /// Bounded wait for a background recorder-finish thread started by
+    /// `stop` or an earlier `stop_recording`, so app exit never orphans an
+    /// ffmpeg process that is still finalizing a file. A no-op if nothing is
+    /// in flight; bounded by that thread's own `finish_recording` timeout.
+    pub fn join_finish(&self) {
+        if let Some(handle) = lock(&self.shared.finish_thread).take() {
+            let _ = handle.join();
+        }
     }
 
     pub fn grab_start(&self, path: impl Into<String>) -> Result<(), String> {
@@ -438,15 +471,29 @@ fn settle_exit(path: &Path, _success: bool, requested: bool, stderr_tail: &str) 
     }
 }
 
+/// How long `finish_recording` waits for `q` alone before escalating to
+/// SIGINT (unix only). A stalled input (ffmpeg blocked reading a camera
+/// that went silent, or a FIFO nobody writes to) never reaches the point of
+/// reading stdin, so `q` alone can leave it running for the full `timeout`
+/// (measured at 27s against a silent FIFO input before this).
+#[cfg(unix)]
+const SIGINT_ESCALATION_DELAY: Duration = Duration::from_secs(2);
+
 /// Stops a recorder cleanly (S1): sends `q` on stdin, drops it, and polls
-/// `try_wait` until `timeout`. SIGKILL is only a last resort, since a killed
+/// `try_wait` until `timeout`. On unix, a child still running after
+/// `SIGINT_ESCALATION_DELAY` gets `SIGINT` next: ffmpeg's interrupt callback
+/// aborts a blocking read, which a stalled input otherwise leaves deaf to
+/// `q` forever. SIGKILL is only the last resort at `timeout`, since a killed
 /// ffmpeg may leave the MP4 unfinalized.
 fn finish_recording(mut recorder: Recorder, timeout: Duration) -> RecordingState {
     if let Some(mut stdin) = recorder.child.stdin.take() {
         let _ = stdin.write_all(b"q");
     }
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let deadline = start + timeout;
     let mut exit_status = None;
+    #[cfg(unix)]
+    let mut sigint_sent = false;
     loop {
         match recorder.child.try_wait() {
             Ok(Some(status)) => {
@@ -456,6 +503,11 @@ fn finish_recording(mut recorder: Recorder, timeout: Duration) -> RecordingState
             Ok(None) => {
                 if Instant::now() >= deadline {
                     break;
+                }
+                #[cfg(unix)]
+                if !sigint_sent && start.elapsed() >= SIGINT_ESCALATION_DELAY {
+                    sigint_sent = true;
+                    send_sigint(recorder.child.id());
                 }
                 thread::sleep(Duration::from_millis(100));
             }
@@ -481,6 +533,16 @@ fn finish_recording(mut recorder: Recorder, timeout: Duration) -> RecordingState
     }
     let success = exit_status.expect("checked above").success();
     settle_exit(&recorder.path, success, true, &tail)
+}
+
+/// Interrupts a child by pid via the `kill` command rather than an unsafe
+/// libc call; ffmpeg treats SIGINT like a clean `q` and aborts any blocking
+/// read from its interrupt callback.
+#[cfg(unix)]
+fn send_sigint(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-s", "INT", &pid.to_string()])
+        .status();
 }
 
 /// Sleeps up to `total`, waking early on shutdown, pause, or `retry_wake`
@@ -973,6 +1035,7 @@ mod ppm_tests {
             phase_started: Arc::new(Mutex::new(Instant::now())),
             has_frame: Arc::new(AtomicBool::new(false)),
             retry_wake: Arc::new(AtomicBool::new(false)),
+            finish_thread: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1477,11 +1540,14 @@ mod tests {
 
 #[cfg(test)]
 mod recording_tests {
-    use super::{RecordingState, finish_recording, recording_args, settle_exit, spawn_recorder};
+    use super::{
+        RECORDING_STOP_TIMEOUT, RecordingState, StreamHandle, finish_recording, lock,
+        recording_args, settle_exit, spawn_recorder,
+    };
 
     #[test]
     fn a_recording_that_cannot_start_reports_why() {
-        let handle = super::StreamHandle::spawn("rtsp://127.0.0.1:1/none", true);
+        let handle = StreamHandle::spawn("rtsp://127.0.0.1:1/none", true);
         handle.report_recording_error("creating /x: permission denied".to_owned());
         assert_eq!(
             handle.recording_state(),
@@ -1491,7 +1557,7 @@ mod recording_tests {
     }
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn ffmpeg_available() -> bool {
         Command::new("ffmpeg").arg("-version").output().is_ok()
@@ -1503,6 +1569,41 @@ mod recording_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
+    }
+
+    /// Binds a loopback listener that accepts one connection and then goes
+    /// silent (never sends data): a deterministic stand-in for a camera
+    /// whose input stalls mid-read (S1's stalled-input bug). A plain FIFO
+    /// does not reproduce this: blocking open() on it is not interrupted by
+    /// SIGINT (confirmed against this system's ffmpeg build — the open()
+    /// auto-restarts), whereas a stalled network read goes through ffmpeg's
+    /// protocol layer, which does check its interrupt callback and is
+    /// exactly what a stalled RTSP camera connection looks like.
+    fn black_hole_listener() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+        addr
+    }
+
+    /// Args for an ffmpeg recording a stalled `black_hole_listener` address.
+    fn stalled_input_args(addr: std::net::SocketAddr, out: &Path) -> Vec<String> {
+        [
+            "-v".to_owned(),
+            "error".to_owned(),
+            "-i".to_owned(),
+            format!("tcp://{addr}"),
+            "-c".to_owned(),
+            "copy".to_owned(),
+            "-f".to_owned(),
+            "mp4".to_owned(),
+            out.display().to_string(),
+        ]
+        .to_vec()
     }
 
     #[test]
@@ -1614,5 +1715,199 @@ mod recording_tests {
         );
         assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "video");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_recording_settles_an_already_exited_child_as_failed_not_saved() {
+        // Defect 4 (S2): an ffmpeg that already exited on its own (bounded
+        // -t clip) must not be read as a requested stop just because
+        // `stop_recording` happened to be called after the fact.
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not available, skipping");
+            return;
+        }
+        let dir = scratch("already-exited");
+        let path = dir.join("clip.mp4");
+        let args: Vec<String> = [
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=160x120:rate=15",
+            "-t",
+            "0.3",
+            "-c:v",
+            "libx264",
+            "-f",
+            "mp4",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain([path.display().to_string()])
+        .collect();
+        let recorder = spawn_recorder(&args, path.clone()).expect("spawn ffmpeg");
+
+        let handle = StreamHandle::spawn("rtsp://127.0.0.1:1/none", true);
+        {
+            let mut slot = lock(&handle.shared.recorder);
+            *slot = Some(recorder);
+            let rec = slot.as_mut().expect("just inserted");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let exited = loop {
+                if matches!(rec.child.try_wait(), Ok(Some(_))) {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            assert!(
+                exited,
+                "the bounded clip must finish on its own well within 5s"
+            );
+        }
+        *lock(&handle.shared.recording_state) = RecordingState::Recording {
+            path: path.clone(),
+            started: Instant::now(),
+        };
+
+        handle.stop_recording();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = handle.recording_state();
+        while matches!(state, RecordingState::Saving { .. }) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            state = handle.recording_state();
+        }
+
+        assert!(
+            matches!(state, RecordingState::Failed(_)),
+            "an ffmpeg that already exited before STOP must settle as Failed, not Saved: {state:?}"
+        );
+        handle.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_recording_escalates_to_sigint_on_a_stalled_input_instead_of_waiting_the_full_timeout()
+    {
+        // Defect 3 (S1): a stalled input (a camera connection accepted
+        // then gone silent) never gets data, so ffmpeg blocks on the read
+        // and never reaches the point of reading `q` from stdin. Only a
+        // signal can unblock it.
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not available, skipping");
+            return;
+        }
+        let dir = scratch("stalled-finish");
+        let addr = black_hole_listener();
+        let path = dir.join("clip.mp4");
+        let recorder =
+            spawn_recorder(&stalled_input_args(addr, &path), path.clone()).expect("spawn ffmpeg");
+
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
+        let state = finish_recording(recorder, timeout);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "SIGINT around the 2s mark must unblock a stalled read well before the {timeout:?} \
+             SIGKILL fallback, took {elapsed:?}"
+        );
+        assert!(
+            matches!(&state, RecordingState::Failed(msg) if !msg.contains("force-stopped")),
+            "a SIGINT-unblocked stop must not read as a forced-timeout SIGKILL stop: {state:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_handle_with_a_stalled_recorder_never_blocks_the_caller() {
+        // Defect 2 (S1/S2): removing/editing a camera via `apply_cameras`
+        // drops its `StreamHandle` on the UI thread. That must never wait
+        // out a recording's stop timeout.
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not available, skipping");
+            return;
+        }
+        let dir = scratch("drop-no-block");
+        let addr = black_hole_listener();
+        let path = dir.join("clip.mp4");
+        let recorder =
+            spawn_recorder(&stalled_input_args(addr, &path), path.clone()).expect("spawn ffmpeg");
+
+        let handle = StreamHandle::spawn("rtsp://127.0.0.1:1/none", true);
+        *lock(&handle.shared.recorder) = Some(recorder);
+        *lock(&handle.shared.recording_state) = RecordingState::Recording {
+            path: path.clone(),
+            started: Instant::now(),
+        };
+
+        let start = Instant::now();
+        drop(handle);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "dropping a handle with an active recorder must never block the caller \
+             (camera removal/edit runs on the UI thread): took {elapsed:?}"
+        );
+        // The background finish is still in flight; give it a moment before
+        // cleaning up so it does not race the directory removal.
+        std::thread::sleep(Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signalling_then_joining_multiple_stalled_recordings_waits_in_parallel_not_sequentially() {
+        // Defect 5a (app exit): signal every camera first, then wait for
+        // them together — not one camera's full timeout after another.
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not available, skipping");
+            return;
+        }
+        const COUNT: usize = 3;
+        let mut handles = Vec::new();
+        let mut dirs = Vec::new();
+        for i in 0..COUNT {
+            let dir = scratch(&format!("parallel-signal-{i}"));
+            let addr = black_hole_listener();
+            let path = dir.join("clip.mp4");
+            let recorder = spawn_recorder(&stalled_input_args(addr, &path), path.clone())
+                .expect("spawn ffmpeg");
+
+            let handle = StreamHandle::spawn("rtsp://127.0.0.1:1/none", true);
+            *lock(&handle.shared.recorder) = Some(recorder);
+            *lock(&handle.shared.recording_state) = RecordingState::Recording {
+                path: path.clone(),
+                started: Instant::now(),
+            };
+            handles.push(handle);
+            dirs.push(dir);
+        }
+
+        let start = Instant::now();
+        for handle in &handles {
+            handle.stop();
+        }
+        for handle in &handles {
+            handle.join_finish();
+        }
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < RECORDING_STOP_TIMEOUT * 2,
+            "signalling all {COUNT} cameras before waiting must not cost {COUNT} * \
+             the per-camera stop timeout ({RECORDING_STOP_TIMEOUT:?}), took {elapsed:?}"
+        );
+
+        for dir in dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
