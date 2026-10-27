@@ -62,8 +62,15 @@ Branch `feat/ux-pass`; work-unit commits per lot; push/PR/merge remain the user'
   - G2 (reliability, app.rs:4135-4138 and other ffmpeg-dependent tests): tests return early and pass when ffmpeg is missing; make the skip explicit (`#[ignore]` with a reason, or fail unless an opt-out env var is set) so a missing ffmpeg is never reported as a pass.
   - G3 (reliability, stream.rs:221-225): when an exit is settled, the stderr tail can be read before the drain thread has stored ffmpeg's last line; join the drain thread (bounded) before reading the tail on every settle path.
 
+## Release
+- `feat/ux-pass` fast-forwarded onto `main`; README documents recording location and states (`851de1c`); `aeaca34 chore(release): bump version to 0.11.0` pushed to `origin/main`.
+- Annotated tag `v0.11.0` pushed; GitHub Release https://github.com/edoriban/cam-viewer/releases/tag/v0.11.0 with Linux and Windows x86_64 artifacts. Native review of the release candidate approved (readability, 6 advisory findings).
+- v0.11.0 installed locally at `~/.local/bin/cam-viewer` from the published asset.
+- Not verified: recording chips and controls over live video (no RTSP source here). Windows cross-build emits one `unused_mut` warning on a non-unix path.
+
 ## Log
 - L1: "pasale ux pass y taste a la aplicación a ver qué se mejora" → "haz un artifact para poder ver tu propuesta de una manera mas visual" → decisions A, B, C; bug 01 = mp4-graceful; "vamos con esto".
 - L2: independent verify (S1 partial, S2 partial, S5 pass, S6 fail) → defects fixed in T5.
 - L3: native review approved with 10 advisory findings; user: "corrige los problemas enun commit aparte".
 - L4: second native review approved with 3 advisory findings; user: "sí, corrigelas".
+- L5: "ok entonces con estos fixes hacemos la nueva versión" → chose v0.11.0.
