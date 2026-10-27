@@ -12,6 +12,7 @@ cam-viewer shows live video from IP cameras that expose an RTSP stream. Each cam
 - **Per-camera ffmpeg decoding** — one `ffmpeg` process per camera decodes the RTSP stream and outputs rawvideo frames.
 - **Automatic reconnection** — offline or failing streams are retried with a backoff and clearly marked as connecting/online/offline/paused.
 - **Single-owner threads** — each stream has one owner thread that manages the ffmpeg child process lifecycle.
+- **Recording** — RECORD on a live tile saves video and audio (audio as AAC, whatever the mute state) to `$XDG_VIDEOS_DIR/cam-viewer`, or `~/Videos/cam-viewer` when that is not set, as `<camera>_<YYYY-MM-DD>T<HH-MM-SS>Z.mp4` (UTC). STOP finishes the file cleanly; the chip shows `REC mm:ss`, `SAVING…`, then `SAVED · <file>` (click to open the folder) or the error.
 
 ## How it works
 
