@@ -1657,7 +1657,9 @@ fn show_sidebar(ctx: &egui::Context, view: &View, cameras: &[CameraView]) -> Sid
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if cameras.is_empty() {
-                        ui.label(theme::micro_label("NO CAMERAS YET", theme::ASH));
+                        // S10: the header above already reads "NO CAMERAS
+                        // YET"; this must not repeat it.
+                        ui.label(theme::micro_label("ADD ONE TO GET STARTED", theme::ASH));
                         return;
                     }
                     for (i, cam) in cameras.iter().enumerate() {
@@ -1776,7 +1778,16 @@ fn show_grid(
         .show(ctx, |ui| {
             let avail = ui.available_size();
             if cameras.is_empty() {
+                let height_id = egui::Id::new("welcome_block_height");
+                let last_height = ui.memory(|mem| mem.data.get_temp::<f32>(height_id));
+                let offset = welcome_vertical_offset(avail.y, last_height);
+                if offset > 0.0 {
+                    ui.add_space(offset);
+                }
+                let top = ui.cursor().top();
                 empty_state_action = welcome_view(ui);
+                let content_height = ui.cursor().top() - top;
+                ui.memory_mut(|mem| mem.data.insert_temp(height_id, content_height));
                 return;
             }
             let cols = pick_columns(avail, cameras.len());
@@ -1846,7 +1857,9 @@ fn welcome_view(ui: &mut egui::Ui) -> GridAction {
             "Finds ONVIF and RTSP cameras on your network interfaces.",
             "DISCOVER",
             BtnVariant::Confirm,
-        ) {
+        )
+        .0
+        {
             action = GridAction::GoToDiscover;
         }
         ui.add_space(10.0);
@@ -1857,11 +1870,18 @@ fn welcome_view(ui: &mut egui::Ui) -> GridAction {
             "Paste an rtsp:// address, e.g. rtsp://192.168.1.20/stream1",
             "+ ADD CAMERA",
             BtnVariant::Paper,
-        ) {
+        )
+        .0
+        {
             action = GridAction::GoToSettings;
         }
     } else {
         let width = ((available - WELCOME_OPTION_GAP) / 2.0).max(WELCOME_OPTION_MIN_WIDTH);
+        // Matches the grid's own GRID_SPACING pattern: without this, egui's
+        // default item_spacing is inserted in addition to the explicit
+        // WELCOME_OPTION_GAP below, pushing the right card's edge past the
+        // grid's 18px margin (S11).
+        ui.spacing_mut().item_spacing.x = 0.0;
         ui.horizontal(|ui| {
             if welcome_option(
                 ui,
@@ -1870,7 +1890,9 @@ fn welcome_view(ui: &mut egui::Ui) -> GridAction {
                 "Finds ONVIF and RTSP cameras on your network interfaces.",
                 "DISCOVER",
                 BtnVariant::Confirm,
-            ) {
+            )
+            .0
+            {
                 action = GridAction::GoToDiscover;
             }
             ui.add_space(WELCOME_OPTION_GAP);
@@ -1881,12 +1903,25 @@ fn welcome_view(ui: &mut egui::Ui) -> GridAction {
                 "Paste an rtsp:// address, e.g. rtsp://192.168.1.20/stream1",
                 "+ ADD CAMERA",
                 BtnVariant::Paper,
-            ) {
+            )
+            .0
+            {
                 action = GridAction::GoToSettings;
             }
         });
     }
     action
+}
+
+/// Vertical offset (S12) to center the welcome block within
+/// `available_height`, given its rendered height on the previous frame.
+/// `None` the first frame (not measured yet): renders top-aligned once
+/// rather than guessing, settling into place from the next frame on.
+fn welcome_vertical_offset(available_height: f32, content_height: Option<f32>) -> f32 {
+    match content_height {
+        Some(height) => ((available_height - height) / 2.0).max(0.0),
+        None => 0.0,
+    }
 }
 
 /// Whether the two welcome option blocks must stack vertically instead of
@@ -1913,6 +1948,8 @@ fn welcome_option_content_width(width: f32) -> f32 {
     (width - 2.0 * (WELCOME_OPTION_INNER_MARGIN + WELCOME_OPTION_BORDER)).max(0.0)
 }
 
+/// Returns whether `button` was clicked, and the card's own rendered rect
+/// (S11: callers compare its right edge against the grid's margin).
 fn welcome_option(
     ui: &mut egui::Ui,
     width: f32,
@@ -1920,10 +1957,10 @@ fn welcome_option(
     body: &str,
     button: &str,
     variant: BtnVariant,
-) -> bool {
+) -> (bool, egui::Rect) {
     let mut clicked = false;
     let content_width = welcome_option_content_width(width);
-    egui::Frame::new()
+    let frame = egui::Frame::new()
         .stroke(egui::Stroke::new(WELCOME_OPTION_BORDER, theme::BORDER_DIM))
         .inner_margin(egui::Margin::same(WELCOME_OPTION_INNER_MARGIN as i8))
         .show(ui, |ui| {
@@ -1942,7 +1979,7 @@ fn welcome_option(
                 }
             });
         });
-    clicked
+    (clicked, frame.response.rect)
 }
 
 /// Near-square column count: 1x1, 1x2, 2x2, 2x3, 3x3, 3x4, 4x4… (smallest
@@ -2555,11 +2592,12 @@ impl StatusCounts {
 }
 
 /// Sidebar header text, split so the "N/M ONLINE" part can be drawn in
-/// STATUS_ONLINE while the rest stays ASH. `total == 0` keeps the original
-/// "0 SIGNALS · LOCAL ONLY" copy instead of a nonsensical "0/0 ONLINE".
+/// STATUS_ONLINE while the rest stays ASH. `total == 0` reads "NO CAMERAS
+/// YET" (S10) instead of a nonsensical "0/0 ONLINE"; the separate CAMERAS
+/// list's own empty-state label must not repeat this (see `show_sidebar`).
 fn sidebar_summary(counts: StatusCounts) -> (String, String) {
     if counts.total == 0 {
-        return ("0 SIGNALS \u{b7} LOCAL ONLY".to_owned(), String::new());
+        return ("NO CAMERAS YET".to_owned(), String::new());
     }
     let main = format!("{}/{} ONLINE", counts.online, counts.total);
     let mut suffix = String::new();
@@ -2927,15 +2965,7 @@ fn segmented_row<T: Copy + PartialEq>(
     ui.horizontal(|ui| {
         for (option, label) in options {
             let selected = *current == *option;
-            if theme::brutal_button(
-                ui,
-                label,
-                if selected {
-                    BtnVariant::Paper
-                } else {
-                    BtnVariant::Ink
-                },
-            ) {
+            if theme::segment_button(ui, label, selected) {
                 *current = *option;
             }
             ui.add_space(6.0);
@@ -3131,6 +3161,71 @@ mod tests {
         });
         cam.stream.stop();
         targets
+    }
+
+    /// Renders the two side-by-side welcome cards exactly as `welcome_view`
+    /// lays them out, at a fixed available width, and returns each card's
+    /// own rendered rect (not a heuristic guess at it).
+    fn side_by_side_welcome_card_rects(available_width: f32) -> (egui::Rect, egui::Rect) {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(available_width, 400.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |_| {});
+        let mut rects = None;
+        let _ = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new())
+                .show(ctx, |ui| {
+                    let width = ((available_width - WELCOME_OPTION_GAP) / 2.0)
+                        .max(WELCOME_OPTION_MIN_WIDTH);
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.horizontal(|ui| {
+                        let (_, rect1) = welcome_option(
+                            ui,
+                            width,
+                            "Scan this network",
+                            "Finds ONVIF and RTSP cameras on your network interfaces.",
+                            "DISCOVER",
+                            BtnVariant::Confirm,
+                        );
+                        ui.add_space(WELCOME_OPTION_GAP);
+                        let (_, rect2) = welcome_option(
+                            ui,
+                            width,
+                            "I have a URL",
+                            "Paste an rtsp:// address, e.g. rtsp://192.168.1.20/stream1",
+                            "+ ADD CAMERA",
+                            BtnVariant::Paper,
+                        );
+                        rects = Some((rect1, rect2));
+                    });
+                });
+        });
+        rects.expect("both welcome cards rendered")
+    }
+
+    #[test]
+    fn welcome_cards_side_by_side_right_edge_matches_the_grid_margin() {
+        // The grid's own CentralPanel reserves the same 18px margin on every
+        // side (`show_grid`'s `inner_margin(Margin::same(18))`), so a card
+        // reaching exactly `available_width` lands on that same margin.
+        let available_width = 1172.0_f32;
+        let (first, second) = side_by_side_welcome_card_rects(available_width);
+        assert!(
+            first.right() < second.left(),
+            "cards must not overlap: {first:?} vs {second:?}"
+        );
+        assert!(
+            (second.right() - available_width).abs() < 0.6,
+            "second card's right edge {} must match the grid's margin at {available_width}",
+            second.right()
+        );
     }
 
     #[test]
@@ -3743,9 +3838,11 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_summary_keeps_the_zero_camera_copy() {
+    fn sidebar_summary_reads_no_cameras_yet_when_empty() {
+        // S10: was "0 SIGNALS \u{b7} LOCAL ONLY"; must not duplicate the
+        // separate CAMERAS list's own empty-state label.
         let (main, suffix) = sidebar_summary(counts(0, 0, 0, 0));
-        assert_eq!(main, "0 SIGNALS \u{b7} LOCAL ONLY");
+        assert_eq!(main, "NO CAMERAS YET");
         assert_eq!(suffix, "");
     }
 
@@ -3957,6 +4054,24 @@ mod tests {
     }
 
     // -- T4a: welcome options must not overflow their bounds -----------------
+
+    #[test]
+    fn welcome_vertical_offset_centers_when_shorter_than_available() {
+        assert_eq!(welcome_vertical_offset(500.0, Some(300.0)), 100.0);
+    }
+
+    #[test]
+    fn welcome_vertical_offset_is_zero_when_content_fills_or_exceeds_available() {
+        assert_eq!(welcome_vertical_offset(300.0, Some(500.0)), 0.0);
+        assert_eq!(welcome_vertical_offset(300.0, Some(300.0)), 0.0);
+    }
+
+    #[test]
+    fn welcome_vertical_offset_is_zero_without_a_prior_measurement() {
+        // First frame: the block hasn't been measured yet, so it renders
+        // top-aligned once rather than guessing.
+        assert_eq!(welcome_vertical_offset(500.0, None), 0.0);
+    }
 
     #[test]
     fn welcome_options_stack_when_the_window_is_too_narrow_for_two_side_by_side() {

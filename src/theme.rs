@@ -264,6 +264,55 @@ pub fn brutal_button(ui: &mut egui::Ui, text: &str, variant: BtnVariant) -> bool
     draw_brutal_button(ui, None, text, variant)
 }
 
+/// Fill/text pair for a segmented-control option (S9): "claro + sombra =
+/// accion" is `brutal_button`'s paper fill + offset shadow, reserved for
+/// actions. Segments instead read as "red mark = selected, border =
+/// available" (drawn by `segment_button`), so selection must never borrow
+/// the action palette.
+pub fn segment_palette(selected: bool) -> (egui::Color32, egui::Color32) {
+    if selected {
+        (INK, PAPER)
+    } else {
+        (egui::Color32::TRANSPARENT, ASH)
+    }
+}
+
+/// Segmented-control option (S9): dark fill + red corner marker + red
+/// bottom rule when selected; transparent with a CONCRETE border and ASH
+/// text when not. Never `brutal_button`'s paper fill or offset shadow.
+pub fn segment_button(ui: &mut egui::Ui, text: &str, selected: bool) -> bool {
+    let font = mono_font(11.0);
+    let padding = ui.spacing().button_padding;
+    let (fill, fg) = segment_palette(selected);
+    let measured = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), fg);
+    let desired = measured.size() + padding * 2.0;
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, fill);
+    if selected {
+        let marker =
+            egui::Rect::from_min_size(rect.left_top() + egui::vec2(4.0, 4.0), egui::vec2(6.0, 6.0));
+        painter.rect_filled(marker, 0.0, STATUS_OFFLINE);
+        let rule = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.bottom() - 3.0),
+            egui::vec2(rect.width(), 3.0),
+        );
+        painter.rect_filled(rule, 0.0, STATUS_OFFLINE);
+    } else {
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(2.0_f32, CONCRETE),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let galley = painter.layout_no_wrap(text.to_owned(), font, fg);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, fg);
+    response.clicked()
+}
+
 pub fn brutal_button_sized(
     ui: &mut egui::Ui,
     size: egui::Vec2,
@@ -513,5 +562,28 @@ mod contrast_tests {
     fn concrete_and_paper_are_unchanged() {
         assert_eq!(CONCRETE, egui::Color32::from_rgb(0xB9, 0xB5, 0xAA));
         assert_eq!(PAPER, egui::Color32::from_rgb(0xEC, 0xE9, 0xE0));
+    }
+}
+
+#[cfg(test)]
+mod segment_palette_tests {
+    use super::*;
+
+    #[test]
+    fn selected_segment_uses_a_dark_fill_never_the_brutal_button_paper_fill() {
+        let (fill, text) = segment_palette(true);
+        assert_eq!(fill, INK, "selected segments are not action buttons");
+        assert_ne!(
+            fill, PAPER,
+            "paper fill reads as an action, not a selection"
+        );
+        assert_eq!(text, PAPER);
+    }
+
+    #[test]
+    fn unselected_segment_is_transparent_with_ash_text() {
+        let (fill, text) = segment_palette(false);
+        assert_eq!(fill, egui::Color32::TRANSPARENT);
+        assert_eq!(text, ASH);
     }
 }
