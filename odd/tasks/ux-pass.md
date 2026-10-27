@@ -44,5 +44,8 @@ Branch `feat/ux-pass`; work-unit commits per lot; push/PR/merge remain the user'
   - ffprobe: covered by `finishing_a_recording_leaves_a_file_ffprobe_can_read` (real ffmpeg, `q` stop, ffprobe reads video).
   - NOT verified: live video with controls over a frame, REC/SAVING/SAVED chips, unlocked segmented control — no RTSP server available locally.
 
+- [x] T5 — Fix 4 defects from independent gentle-ai-verify (Discover bypassed S6 lock; Drop blocked UI; stalled input ignored `q`; already-exited recorder read SAVED) + parallel exit join. Route: gentle-ai-worker. Commit: see `git log` (fix(recording): never lose a recording...). Evidence: 187 lib passed, RED per defect observed by worker; SIGINT escalation tested against a silent TCP listener (FIFO open() is not interruptible by SIGINT).
+
 ## Log
 - L1: "pasale ux pass y taste a la aplicación a ver qué se mejora" → "haz un artifact para poder ver tu propuesta de una manera mas visual" → decisions A, B, C; bug 01 = mp4-graceful; "vamos con esto".
+- L2: independent verify (S1 partial, S2 partial, S5 pass, S6 fail) → defects fixed in T5.
