@@ -1836,24 +1836,21 @@ fn show_grid(
                 ui.memory_mut(|mem| mem.data.insert_temp(height_id, content_height));
                 return;
             }
-            let cols = pick_columns(avail, cameras.len());
-            let rows = cameras.len().div_ceil(cols);
-            let aspect = 16.0_f32 / 9.0;
-            let tile_w_from_cols =
-                ((avail.x - GRID_SPACING * (cols - 1) as f32) / cols as f32).max(160.0);
-            // Shrink tiles (keeping 16:9) so all rows fit the viewport when possible.
-            let tile_h_fit = ((avail.y - GRID_SPACING * (rows - 1) as f32) / rows as f32).max(90.0);
-            let tile_w = tile_w_from_cols.min(tile_h_fit * aspect);
-            let tile_h = tile_w / aspect;
-            let needed_h = rows as f32 * tile_h + (rows - 1) as f32 * GRID_SPACING;
+            let cols_id = egui::Id::new("grid_cols");
+            let prev_cols = ui.memory(|mem| mem.data.get_temp::<usize>(cols_id));
+            let geometry = grid_geometry(avail, cameras.len(), prev_cols);
+            ui.memory_mut(|mem| mem.data.insert_temp(cols_id, geometry.cols));
+            let needed_h =
+                geometry.rows as f32 * geometry.tile_h + (geometry.rows - 1) as f32 * GRID_SPACING;
 
             ui.spacing_mut().item_spacing = egui::vec2(GRID_SPACING, GRID_SPACING);
             let layout = GridTileLayout {
-                cols,
-                tile_w,
-                tile_h,
+                cols: geometry.cols,
+                tile_w: geometry.tile_w,
+                tile_h: geometry.tile_h,
             };
-            if needed_h <= avail.y {
+            if geometry.fits && needed_h <= avail.y {
+                ui.add_space(((avail.y - needed_h) / 2.0).max(0.0));
                 draw_grid_rows(ui, cameras, layout, badge_position, &mut opened);
             } else {
                 egui::ScrollArea::vertical()
@@ -2032,18 +2029,81 @@ fn welcome_option(
     (clicked, frame.response.rect)
 }
 
-/// Near-square column count: 1x1, 1x2, 2x2, 2x3, 3x3, 3x4, 4x4… (smallest
-/// `cols` that keeps rows within `cols + 1`), capped by ~360px minimum tile
-/// width. Vertical overflow is handled by the caller's scroll fallback.
-fn pick_columns(avail: egui::Vec2, count: usize) -> usize {
+const GRID_ASPECT: f32 = 16.0 / 9.0;
+/// Smallest tile the grid draws, whatever the window size.
+const GRID_ABSOLUTE_MIN_TILE_WIDTH: f32 = 160.0;
+/// A new column count must beat the current one by this factor before the
+/// grid switches, so resizing near a tie does not flicker between layouts.
+const GRID_SWITCH_GAIN: f32 = 1.05;
+
+/// Grid shape and tile size for `count` cameras in `avail`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GridGeometry {
+    cols: usize,
+    rows: usize,
+    tile_w: f32,
+    tile_h: f32,
+    /// Every row fits `avail` without scrolling.
+    fits: bool,
+}
+
+/// Widest 16:9 tile that lets `count` tiles in `cols` columns fit `avail`
+/// on both axes.
+fn grid_fit_tile_width(avail: egui::Vec2, count: usize, cols: usize) -> f32 {
+    let rows = count.div_ceil(cols);
+    let by_width = (avail.x - GRID_SPACING * (cols - 1) as f32) / cols as f32;
+    let by_height = (avail.y - GRID_SPACING * (rows - 1) as f32) / rows as f32;
+    by_width.min(by_height * GRID_ASPECT)
+}
+
+/// Picks the column count that gives the largest tiles without scrolling,
+/// so a wide window lays cameras out in fewer, longer rows and a tall one
+/// stacks them. `prev_cols` is kept unless another count beats it by
+/// `GRID_SWITCH_GAIN` (and only while its tiles stay at least
+/// `GRID_MIN_TILE_WIDTH` wide, or no option reaches that). When even the
+/// best fit would shrink tiles below `GRID_MIN_TILE_WIDTH` and there are
+/// several cameras, it falls back to as many min-width columns as the width
+/// allows; that layout scrolls only if its rows exceed the height.
+fn grid_geometry(avail: egui::Vec2, count: usize, prev_cols: Option<usize>) -> GridGeometry {
+    let count = count.max(1);
+    let (mut cols, mut tile_w) = (1..=count)
+        .map(|cols| (cols, grid_fit_tile_width(avail, count, cols)))
+        .fold((1, f32::MIN), |best, c| if c.1 > best.1 { c } else { best });
+    if let Some(prev) = prev_cols.filter(|p| (1..=count).contains(p)) {
+        let prev_w = grid_fit_tile_width(avail, count, prev);
+        let prev_usable = prev_w >= GRID_MIN_TILE_WIDTH || tile_w < GRID_MIN_TILE_WIDTH;
+        if prev_usable && prev_w * GRID_SWITCH_GAIN >= tile_w {
+            (cols, tile_w) = (prev, prev_w);
+        }
+    }
+
     let cols_by_width = (((avail.x + GRID_SPACING) / (GRID_MIN_TILE_WIDTH + GRID_SPACING))
         .floor()
         .max(1.0)) as usize;
-    let mut cols = 1;
-    while cols * (cols + 1) < count {
-        cols += 1;
+    let scroll_cols = cols_by_width.min(count);
+    let mut fits = true;
+    if tile_w < GRID_MIN_TILE_WIDTH && count.div_ceil(scroll_cols) > 1 {
+        cols = scroll_cols;
+        tile_w = (avail.x - GRID_SPACING * (cols - 1) as f32) / cols as f32;
+        let rows = count.div_ceil(cols) as f32;
+        let needed_h = rows * tile_w.max(GRID_ABSOLUTE_MIN_TILE_WIDTH) / GRID_ASPECT
+            + (rows - 1.0) * GRID_SPACING;
+        fits = needed_h <= avail.y;
     }
-    cols.min(cols_by_width).min(count).max(1)
+    let tile_w = tile_w.max(GRID_ABSOLUTE_MIN_TILE_WIDTH);
+    GridGeometry {
+        cols,
+        rows: count.div_ceil(cols),
+        tile_w,
+        tile_h: tile_w / GRID_ASPECT,
+        fits,
+    }
+}
+
+/// Left inset that centers a row of `n` tiles inside `avail_w`.
+fn grid_row_offset(avail_w: f32, n: usize, tile_w: f32) -> f32 {
+    let row_w = n as f32 * tile_w + n.saturating_sub(1) as f32 * GRID_SPACING;
+    ((avail_w - row_w) / 2.0).max(0.0)
 }
 
 struct GridTileLayout {
@@ -2060,8 +2120,11 @@ fn draw_grid_rows(
     opened: &mut Option<usize>,
 ) {
     let total = cameras.len();
+    let avail_w = ui.available_width();
     for start in (0..total).step_by(layout.cols) {
+        let in_row = layout.cols.min(total - start);
         ui.horizontal(|ui| {
+            ui.add_space(grid_row_offset(avail_w, in_row, layout.tile_w));
             for (i, cam) in cameras
                 .iter_mut()
                 .enumerate()
@@ -4243,6 +4306,198 @@ mod tests {
     }
 
     // -- T4a: welcome options must not overflow their bounds -----------------
+
+    // -- Grid auto-layout: pick the column count that maximizes tile size ----
+
+    #[test]
+    fn grid_uses_a_single_row_for_three_cameras_in_a_wide_window() {
+        let g = grid_geometry(egui::vec2(2500.0, 700.0), 3, None);
+        assert_eq!((g.cols, g.rows), (3, 1));
+        assert!(g.fits);
+        assert!((g.tile_w - (2500.0 - 2.0 * GRID_SPACING) / 3.0).abs() < 0.01);
+        assert!((g.tile_h - g.tile_w * 9.0 / 16.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn grid_uses_a_single_row_for_four_cameras_in_an_ultrawide_window() {
+        let g = grid_geometry(egui::vec2(3000.0, 500.0), 4, None);
+        assert_eq!((g.cols, g.rows), (4, 1));
+    }
+
+    #[test]
+    fn grid_keeps_two_by_two_for_four_cameras_in_a_16_9_window() {
+        let g = grid_geometry(egui::vec2(1600.0, 900.0), 4, None);
+        assert_eq!((g.cols, g.rows), (2, 2));
+        assert!(g.fits);
+    }
+
+    #[test]
+    fn grid_stacks_cameras_in_a_tall_window() {
+        let g = grid_geometry(egui::vec2(600.0, 1400.0), 3, None);
+        assert_eq!((g.cols, g.rows), (1, 3));
+    }
+
+    #[test]
+    fn grid_falls_back_to_scrolling_when_tiles_would_be_too_small() {
+        let g = grid_geometry(egui::vec2(800.0, 400.0), 9, None);
+        assert!(!g.fits);
+        assert_eq!(g.cols, 2); // as many min-width columns as the width allows
+        assert!(g.tile_w >= GRID_MIN_TILE_WIDTH);
+    }
+
+    #[test]
+    fn grid_fits_a_single_camera_in_a_tiny_window_without_scrolling() {
+        let g = grid_geometry(egui::vec2(300.0, 150.0), 1, None);
+        assert_eq!(g.cols, 1);
+        assert!(g.fits);
+        assert!(g.tile_h <= 150.0);
+    }
+
+    #[test]
+    fn grid_keeps_the_previous_column_count_when_the_new_best_is_barely_bigger() {
+        // cols=2 gives 800px tiles, cols=1 gives ~789px: within 5%.
+        let avail = egui::vec2(1612.0, 900.0);
+        assert_eq!(grid_geometry(avail, 2, None).cols, 2);
+        assert_eq!(grid_geometry(avail, 2, Some(1)).cols, 1);
+        // A clearly better option still wins over the previous one.
+        assert_eq!(grid_geometry(egui::vec2(2500.0, 700.0), 3, Some(2)).cols, 3);
+    }
+
+    #[test]
+    fn grid_does_not_keep_a_previous_layout_whose_tiles_fall_below_the_minimum() {
+        // cols=2 gives ~347px tiles (below 360), cols=1 ~362px: within 5%,
+        // but keeping cols=2 would force one frame of the scroll fallback.
+        let g = grid_geometry(egui::vec2(706.0, 419.0), 2, Some(2));
+        assert_eq!(g.cols, 1);
+        assert!(g.fits);
+    }
+
+    #[test]
+    fn grid_narrower_than_the_minimum_tile_still_fits_when_rows_fit_vertically() {
+        // Panel narrower than GRID_MIN_TILE_WIDTH: one column of full-width
+        // tiles fits the height, so it must stay on the centered path.
+        let g = grid_geometry(egui::vec2(340.0, 1382.0), 3, None);
+        assert_eq!(g.cols, 1);
+        assert!(g.fits);
+    }
+
+    #[test]
+    fn grid_hysteresis_settles_within_the_switch_gain() {
+        for n in 1..=9 {
+            for w in (100..=2600).step_by(23) {
+                for h in (60..=1600).step_by(23) {
+                    let a = egui::vec2(w as f32, h as f32);
+                    let fresh = grid_geometry(a, n, None);
+                    for p in 1..=n {
+                        let mut prev = p;
+                        let mut g = fresh;
+                        for _ in 0..n + 2 {
+                            g = grid_geometry(a, n, Some(prev));
+                            if g.cols == prev {
+                                break;
+                            }
+                            prev = g.cols;
+                        }
+                        assert_eq!(g.cols, prev, "no fixed point {w}x{h} n={n} p={p}");
+                        if fresh.fits {
+                            assert!(
+                                g.fits && g.tile_w * GRID_SWITCH_GAIN >= fresh.tile_w - 1e-3,
+                                "{w}x{h} n={n} p={p}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tile rects `show_grid` actually lays out for `n` cameras on a
+    /// `screen`-sized window, after a real egui pass.
+    fn grid_tile_rects(screen: egui::Vec2, n: usize) -> Vec<egui::Rect> {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let mut cams: Vec<CameraView> = (0..n)
+            .map(|i| CameraView {
+                name: format!("c{i}"),
+                url: "rtsp://127.0.0.1:1/none".to_owned(),
+                stream: StreamHandle::spawn("rtsp://127.0.0.1:1/none", true),
+                texture: None,
+            })
+            .collect();
+        let _ = ctx.run(input(), |_| {});
+        let g = grid_geometry(screen - egui::vec2(36.0, 36.0), n, None);
+        let mut rects = Vec::new();
+        for _ in 0..2 {
+            let _ = ctx.run(input(), |ctx| {
+                show_grid(ctx, &mut cams, BadgePosition::default());
+                rects = ctx.viewport(|v| {
+                    v.this_pass
+                        .widgets
+                        .layers()
+                        .flat_map(|(_, w)| w.iter())
+                        .filter(|w| {
+                            w.sense.senses_click()
+                                && (w.rect.width() - g.tile_w).abs() < 0.6
+                                && (w.rect.height() - g.tile_h).abs() < 0.6
+                        })
+                        .map(|w| w.rect)
+                        .collect()
+                });
+            });
+        }
+        for c in &cams {
+            c.stream.stop();
+        }
+        rects.dedup();
+        rects
+    }
+
+    #[test]
+    fn grid_centers_rows_and_partial_last_row_in_the_panel() {
+        let r = grid_tile_rects(egui::vec2(1036.0, 736.0), 5);
+        assert_eq!(r.len(), 5);
+        let top = r.iter().map(|t| t.min.y).fold(f32::MAX, f32::min) - 18.0;
+        let bottom = 718.0 - r.iter().map(|t| t.max.y).fold(f32::MIN, f32::max);
+        assert!((top - bottom).abs() < 1.0, "top {top} bottom {bottom}");
+        let last = r
+            .iter()
+            .max_by(|a, b| a.min.y.total_cmp(&b.min.y))
+            .expect("five tiles were asserted above");
+        assert!(((last.min.x - 18.0) - (1018.0 - last.max.x)).abs() < 1.0);
+    }
+
+    #[test]
+    fn grid_centers_a_width_limited_grid_vertically() {
+        // 5 cameras in a 1000x1000 panel: 2 columns of ~494px tiles are
+        // width-limited, leaving vertical slack the grid must split evenly.
+        let g = grid_geometry(egui::vec2(1000.0, 1000.0), 5, None);
+        let needed = g.rows as f32 * g.tile_h + (g.rows - 1) as f32 * GRID_SPACING;
+        assert!(1000.0 - needed > 40.0);
+        let r = grid_tile_rects(egui::vec2(1036.0, 1036.0), 5);
+        assert_eq!(r.len(), 5);
+        let top = r.iter().map(|t| t.min.y).fold(f32::MAX, f32::min) - 18.0;
+        let bottom = 1018.0 - r.iter().map(|t| t.max.y).fold(f32::MIN, f32::max);
+        assert!((top - bottom).abs() < 1.0, "top {top} bottom {bottom}");
+    }
+
+    #[test]
+    fn grid_scroll_fallback_renders_every_camera() {
+        assert!(!grid_geometry(egui::vec2(800.0, 400.0), 9, None).fits);
+        assert_eq!(grid_tile_rects(egui::vec2(836.0, 436.0), 9).len(), 9);
+    }
+
+    #[test]
+    fn grid_row_offset_centers_full_and_partial_rows() {
+        // 3 tiles of 100 with 12 spacing = 324 wide in 524 -> 100 each side.
+        assert_eq!(grid_row_offset(524.0, 3, 100.0), 100.0);
+        // Last row of 5 in a 3-column grid: 2 tiles = 212 wide.
+        assert_eq!(grid_row_offset(524.0, 2, 100.0), 156.0);
+        assert_eq!(grid_row_offset(200.0, 3, 100.0), 0.0);
+    }
 
     #[test]
     fn welcome_vertical_offset_centers_when_shorter_than_available() {
