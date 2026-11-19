@@ -6,7 +6,7 @@ cam-viewer shows live video from IP cameras that expose an RTSP stream. Each cam
 
 ## Features
 
-- **Solo and grid views** — click a tile to view a single camera full-window; return to the grid at any time.
+- **Solo and grid views** — the grid arranges itself to the window shape (one long row in a wide window, a column in a tall one) and stays centered; click a tile to view a single camera full-window; return to the grid at any time.
 - **Auto-pause on focus loss** — streams pause when the window loses focus (and resume when it regains focus), saving bandwidth and CPU.
 - **In-app settings editor** — add, rename, edit, or remove cameras without touching a config file.
 - **Per-camera ffmpeg decoding** — one `ffmpeg` process per camera decodes the RTSP stream and outputs rawvideo frames.
